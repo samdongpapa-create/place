@@ -1,5 +1,12 @@
 import express from "express";
 import { chromium } from "playwright";
+// === 간단 캐시 (같은 URL은 일정시간 재크롤링 안 함) ===
+const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6시간
+const cache = new Map(); // key:url -> { ts, data }
+
+// 429 걸리면 전체적으로 잠깐 쉬기 (네이버가 IP 기준으로 막기 때문)
+let globalCooldownUntil = 0;
+const COOLDOWN_MS_ON_429 = 20 * 60 * 1000; // 20분
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
