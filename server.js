@@ -4,36 +4,25 @@ import { chromium } from "playwright";
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// === 간단 캐시 (같은 URL은 일정시간 재크롤링 안 함) ===
+// === 캐시 (같은 placeId는 일정 시간 재크롤링 안 함) ===
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6시간
-const cache = new Map(); // key:url -> { ts, data }
+const cache = new Map(); // key:placeId -> { ts, data }
 
-// 429 걸리면 전체적으로 잠깐 쉬기 (네이버가 IP 기준으로 막기 때문)
+// 429(요청 과다) 걸리면 전체적으로 잠깐 쉬기
 let globalCooldownUntil = 0;
 const COOLDOWN_MS_ON_429 = 20 * 60 * 1000; // 20분
 
-function normalizeNaverPlaceUrl(input) {
-  let url = (input || "").trim();
-  if (!url) return "";
+function extractPlaceId(input) {
+  const s = (input || "").trim();
+  if (!s) return "";
 
-  if (!/^https?:\/\//i.test(url)) url = "https://" + url;
+  // 사용자가 URL을 넣더라도 숫자만 뽑아냄
+  const m = s.match(/(\d{8,})/); // 8자리 이상 숫자를 placeId로 간주
+  return m ? m[1] : "";
+}
 
-  let u;
-  try {
-    u = new URL(url);
-  } catch {
-    return "";
-  }
-
-  // PC 플레이스 -> 모바일 플레이스
-  if (u.hostname === "place.naver.com") {
-    u.hostname = "m.place.naver.com";
-    return u.toString();
-  }
-
-  // 지도 URL도 그대로 허용 (열면 리다이렉트됨)
-  // map.naver.com, naver.me 등은 그냥 goto 해서 최종 URL을 가져오면 됨
-  return u.toString();
+function placeUrl(placeId) {
+  return `https://m.place.naver.com/place/${placeId}`;
 }
 
 function looksBlocked(text) {
@@ -44,12 +33,11 @@ function looksBlocked(text) {
     t.includes("접근이 제한") ||
     t.includes("비정상적인 접근") ||
     t.includes("captcha") ||
-    t.includes("robot") ||
-    t.includes("권한이 없습니다")
+    t.includes("robot")
   );
 }
 
-// 메인 화면(입력창)
+// ===== 메인 화면 =====
 app.get("/", (req, res) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.end(`
@@ -64,29 +52,43 @@ app.get("/", (req, res) => {
       input{width:100%;padding:12px;border:1px solid #ddd;border-radius:10px;font-size:16px;}
       button{padding:12px 16px;border:0;border-radius:10px;font-size:16px;cursor:pointer;margin-top:10px;}
       pre{white-space:pre-wrap;background:#f7f7f7;padding:12px;border-radius:12px;}
-      .hint{color:#666;font-size:14px}
+      .hint{color:#666;font-size:14px;line-height:1.5}
+      .box{background:#fafafa;border:1px solid #eee;border-radius:12px;padding:12px;margin-top:12px}
+      code{background:#f1f1f1;padding:2px 6px;border-radius:6px}
     </style>
   </head>
   <body>
     <h1>네이버 플레이스 분석기 (MVP)</h1>
-    <p class="hint">지원: map.naver.com / place.naver.com / m.place.naver.com</p>
+    <p class="hint">
+      ✅ <b>placeId 숫자만</b> 입력하면 됩니다. (예: <code>1443688242</code>)<br/>
+      ✅ URL을 넣어도 숫자만 자동으로 뽑아서 처리해요.
+    </p>
 
-    <input id="url" placeholder="예) https://map.naver.com/p/entry/place/1443688242" />
+    <input id="pid" placeholder="placeId 또는 URL (예: 1443688242)" />
     <button onclick="run()">조회</button>
 
-    <h3>결과</h3>
+    <div class="box">
+      <b>placeId는 어디서 복사해요?</b>
+      <div class="hint">
+        1) 네이버지도: <code>https://map.naver.com/p/entry/place/1443688242</code> → 맨 뒤 숫자 복사<br/>
+        2) 모바일플레이스: <code>https://m.place.naver.com/place/1443688242</code> → 맨 뒤 숫자 복사<br/>
+        3) PC플레이스: URL 안에 보이는 숫자(있으면) 복사
+      </div>
+    </div>
+
+    <h3 style="margin-top:18px">결과</h3>
     <pre id="out">대기중...</pre>
 
     <script>
       async function run(){
-        const url = document.getElementById('url').value.trim();
+        const pid = document.getElementById('pid').value.trim();
         const out = document.getElementById('out');
         out.textContent = "불러오는 중...";
         try{
           const r = await fetch('/api/analyze', {
             method:'POST',
             headers:{'Content-Type':'application/json'},
-            body: JSON.stringify({ url })
+            body: JSON.stringify({ placeIdOrUrl: pid })
           });
           const data = await r.json();
           out.textContent = JSON.stringify(data, null, 2);
@@ -100,30 +102,36 @@ app.get("/", (req, res) => {
   `);
 });
 
-// ✅ 이게 네가 말한 “/api/analyze” (분석 API)
+// ===== 분석 API =====
 app.post("/api/analyze", async (req, res) => {
-  const inputUrl = req.body?.url;
+  const input = req.body?.placeIdOrUrl;
 
-  if (!inputUrl || typeof inputUrl !== "string") {
-    return res.status(400).json({ ok: false, error: "url을 넣어주세요" });
+  if (!input || typeof input !== "string") {
+    return res.status(400).json({ ok: false, error: "placeId 숫자를 입력해주세요" });
   }
 
-  const url = normalizeNaverPlaceUrl(inputUrl);
-  if (!url) return res.status(400).json({ ok: false, error: "URL 형식이 올바르지 않아요" });
+  const placeId = extractPlaceId(input);
+  if (!placeId) {
+    return res.status(400).json({
+      ok: false,
+      error: "placeId(숫자)를 찾지 못했어요. 예: 1443688242"
+    });
+  }
 
-  // 전역 쿨다운 체크
+  // 전역 쿨다운
   if (Date.now() < globalCooldownUntil) {
     const waitSec = Math.ceil((globalCooldownUntil - Date.now()) / 1000);
     return res.status(200).json({
       ok: false,
       blocked: true,
       reason: "cooldown",
-      message: `네이버가 요청 과다로 제한 중이라 잠시 쉬는 중입니다. 약 ${waitSec}초 후 다시 시도해주세요.`
+      placeId,
+      message: `요청 과다로 잠시 쉬는 중입니다. 약 ${waitSec}초 후 다시 시도해주세요.`
     });
   }
 
-  // 캐시 체크
-  const cached = cache.get(url);
+  // 캐시
+  const cached = cache.get(placeId);
   if (cached && (Date.now() - cached.ts) < CACHE_TTL_MS) {
     return res.status(200).json({
       ...cached.data,
@@ -131,6 +139,8 @@ app.post("/api/analyze", async (req, res) => {
       cachedAt: new Date(cached.ts).toISOString()
     });
   }
+
+  const targetUrl = placeUrl(placeId);
 
   let browser;
   try {
@@ -142,57 +152,45 @@ app.post("/api/analyze", async (req, res) => {
     const page = await browser.newPage();
     page.setDefaultTimeout(30000);
 
-    // URL 이동 (지도/단축링크도 리다이렉트로 최종 URL로 바뀜)
-    const resp = await page.goto(url, { waitUntil: "domcontentloaded" });
+    const resp = await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
     const status = resp?.status?.() ?? null;
 
-    // 최종 URL이 PC 플레이스면 모바일로 한번 더 이동
-    const finalUrl1 = page.url();
-    const finalNormalized = normalizeNaverPlaceUrl(finalUrl1);
-    if (finalNormalized && finalNormalized !== finalUrl1) {
-      await page.goto(finalNormalized, { waitUntil: "domcontentloaded" });
-    }
-
-    const finalUrl = page.url();
-
     const bodyText = await page.locator("body").innerText().catch(() => "");
-    const snippet = (bodyText || "").replace(/\s+/g, " ").trim().slice(0, 250);
+    const snippet = (bodyText || "").replace(/\s+/g, " ").trim().slice(0, 260);
 
-    // 429 처리
+    // 429 또는 차단 페이지 감지
     if (status === 429 || looksBlocked(bodyText)) {
       globalCooldownUntil = Date.now() + COOLDOWN_MS_ON_429;
       return res.status(200).json({
         ok: false,
         blocked: true,
         reason: status === 429 ? "rate_limited" : "blocked_page",
-        inputUrl,
-        usedUrl: url,
-        finalUrl,
+        placeId,
+        targetUrl,
         status,
         message: "요청 과다/접근 제한으로 자동 수집이 일시 제한되었습니다. 잠시 후 다시 시도해주세요.",
         snippet
       });
     }
 
-    // MVP: 최소 정보
+    // MVP: 일단 크롤링 성공 여부를 보여주는 최소 정보만
     const title = await page.title().catch(() => "");
 
     const successData = {
       ok: true,
-      inputUrl,
-      usedUrl: url,
-      finalUrl,
+      placeId,
+      targetUrl,
       status,
       title,
       snippet
     };
 
     // 캐시 저장
-    cache.set(url, { ts: Date.now(), data: successData });
+    cache.set(placeId, { ts: Date.now(), data: successData });
 
     return res.json(successData);
   } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    return res.status(500).json({ ok: false, placeId, error: String(e?.message || e) });
   } finally {
     if (browser) await browser.close().catch(() => {});
   }
