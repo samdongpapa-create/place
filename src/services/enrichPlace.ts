@@ -43,7 +43,10 @@ export async function enrichPlace(place: PlaceProfileLike): Promise<PlaceProfile
       // (A) /price HTML 파싱
       try {
         const fetched = await fetchPlaceHtml(priceUrl, { minLength: 120 });
-        const parsed = parsePlaceFromHtml(fetched.html, fetched.finalUrl);
+
+        // ✅ parsePlaceFromHtml 리턴 타입에 menus가 없을 수 있어 캐스팅으로 방어
+        const parsed = (parsePlaceFromHtml(fetched.html, fetched.finalUrl) as unknown) as PlaceProfileLike | null;
+
         const cleaned = parsed?.menus ? cleanMenus(parsed.menus) : [];
         debug.chain.push({ step: "hair-price-html", url: priceUrl, len: fetched.html.length, menus: cleaned.length });
 
@@ -95,9 +98,11 @@ export async function enrichPlace(place: PlaceProfileLike): Promise<PlaceProfile
     for (const url of [`${base}/menu`, `${base}/home`, `${base}/price`]) {
       try {
         const fetched = await fetchPlaceHtml(url, { minLength: 120 });
-        const parsed = parsePlaceFromHtml(fetched.html, fetched.finalUrl);
-        const cleaned = parsed?.menus ? cleanMenus(parsed.menus) : [];
 
+        // ✅ parsePlaceFromHtml 리턴 타입에 menus가 없을 수 있어 캐스팅으로 방어
+        const parsed = (parsePlaceFromHtml(fetched.html, fetched.finalUrl) as unknown) as PlaceProfileLike | null;
+
+        const cleaned = parsed?.menus ? cleanMenus(parsed.menus) : [];
         debug.chain.push({ step: "html", url, len: fetched.html.length, menus: cleaned.length });
 
         if (cleaned.length) {
