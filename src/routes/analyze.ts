@@ -15,6 +15,8 @@ import { applyPlanToRecommend } from "../services/applyPlan.js";
 
 export const analyzeRouter = Router();
 
+const hasNext = (html: string) => /id="__NEXT_DATA__"/i.test(html);
+
 analyzeRouter.post("/analyze", async (req, res) => {
   const parsed = analyzeRequestSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -27,16 +29,64 @@ analyzeRouter.post("/analyze", async (req, res) => {
   const { input, options } = parsed.data;
   const requestId = `req_${Date.now().toString(36)}`;
 
+  // ✅ 디버그: home/price에서 실제로 데이터가 오는지 즉시 판정
+  const debug: any = {
+    resolved: {},
+    home: {},
+    priceProbe: {}
+  };
+
   try {
     const resolved = await resolvePlace(input as any, options as any);
+    debug.resolved = {
+      placeUrl: resolved.placeUrl,
+      confidence: resolved.confidence,
+      placeId: resolved.placeId ?? null
+    };
 
-    // ✅ home도 shell일 수 있으니 minLength 완화(죽지 않게)
-    const fetched = await fetchPlaceHtml(resolved.placeUrl, { minLength: 200, retries: 1, timeoutMs: 9000 });
-    const rawPlace = parsePlaceFromHtml(fetched.html, fetched.finalUrl);
+    // ✅ home은 shell일 수 있으니 minLength 낮추고(죽지 않게) debug 켜기
+    const fetchedHome = await fetchPlaceHtml(resolved.placeUrl, {
+      minLength: 120,
+      retries: 1,
+      timeoutMs: 9000,
+      debug: true
+    });
 
-    let place = normalizePlace({ ...rawPlace, placeUrl: fetched.finalUrl }) as any;
+    debug.home = {
+      finalUrl: fetchedHome.finalUrl,
+      len: fetchedHome.html.length,
+      hasNextData: hasNext(fetchedHome.html)
+    };
 
-    // ✅ /photo, /price 시도 (enrichPlace가 담당)
+    const rawPlace = parsePlaceFromHtml(fetchedHome.html, fetchedHome.finalUrl);
+    let place = normalizePlace({ ...rawPlace, placeUrl: fetchedHome.finalUrl }) as any;
+
+    // ✅ price 탭 probe (실패해도 절대 throw 안 남)
+    // enrichPlace 안에서도 시도하지만, 여기서 한 번 더 “확정 판정용”으로 찍어둠
+    try {
+      const placeId = place?.placeId || resolved.placeId;
+      const priceUrl = placeId
+        ? `https://m.place.naver.com/hairshop/${placeId}/price`
+        : `${(resolved.placeUrl || "").replace(/\/(home|photo|review|price|menu|booking)(\?.*)?$/i, "")}/price`;
+
+      const fetchedPrice = await fetchPlaceHtml(priceUrl, {
+        minLength: 120,
+        retries: 1,
+        timeoutMs: 9000,
+        debug: true
+      });
+
+      debug.priceProbe = {
+        url: priceUrl,
+        finalUrl: fetchedPrice.finalUrl,
+        len: fetchedPrice.html.length,
+        hasNextData: hasNext(fetchedPrice.html)
+      };
+    } catch (e: any) {
+      debug.priceProbe = { error: e?.message ?? String(e) };
+    }
+
+    // ✅ enrich (photo/price/menu/booking 순회)
     place = (await enrichPlace(place)) as any;
 
     const industry = autoClassifyIndustry(place);
@@ -49,10 +99,11 @@ analyzeRouter.post("/analyze", async (req, res) => {
         requestId,
         mode: input.mode,
         plan: options.plan,
-        placeUrl: fetched.finalUrl,
+        placeUrl: fetchedHome.finalUrl,
         resolvedFrom: resolved.placeUrl,
         resolvedConfidence: resolved.confidence ?? null,
-        fetchedAt: new Date().toISOString()
+        fetchedAt: new Date().toISOString(),
+        debug // ✅ 여기!
       },
       industry,
       place,
@@ -63,7 +114,8 @@ analyzeRouter.post("/analyze", async (req, res) => {
     console.error("❌ ANALYZE ERROR", e);
     return res.status(500).json({
       error: "ANALYZE_FAILED",
-      message: e?.message ?? "unknown error"
+      message: e?.message ?? "unknown error",
+      debug
     });
   }
 });
