@@ -30,8 +30,10 @@ export function parsePlaceFromHtml(html: string, placeUrl: string) {
     try { nextData = JSON.parse(nextDataText); } catch { nextData = null; }
   }
 
-  // 후보 데이터 풀 구성
+  // ✅ dehydrated queries를 “풀 스캔”해서 place 핵심 데이터 블록을 찾음
+  const queryDatas: any[] = [];
   const candidates: any[] = [];
+
   if (nextData) {
     candidates.push(nextData);
     const pp = nextData?.props?.pageProps;
@@ -41,15 +43,20 @@ export function parsePlaceFromHtml(html: string, placeUrl: string) {
     if (Array.isArray(dq)) {
       for (const q of dq) {
         const data = q?.state?.data;
-        if (data) candidates.push(data);
+        if (data) {
+          queryDatas.push(data);
+          candidates.push(data);
+        }
       }
     }
   }
   for (const obj of ldObjects) candidates.push(obj);
 
-  const placeId = extractPlaceId(placeUrl) ?? deepFindString(candidates, ["placeId", "businessId", "id"]) ?? undefined;
+  const placeId = extractPlaceId(placeUrl)
+    ?? deepFindString(candidates, ["placeId", "businessId", "id"])
+    ?? undefined;
 
-  // name: ogTitle가 쓸만하면 쓰되 " : 네이버" 꼬리 제거
+  // name
   const nameFromData = deepFindString(candidates, ["placeName", "bizName", "name", "title"]);
   const rawName = isUselessTitle(ogTitle) ? (nameFromData ?? "UNKNOWN") : (ogTitle ?? nameFromData ?? "UNKNOWN");
   const name = cleanupName(rawName);
@@ -59,33 +66,31 @@ export function parsePlaceFromHtml(html: string, placeUrl: string) {
   const address = deepFindString(candidates, ["jibunAddress", "address", "addr"]) ?? undefined;
   const roadAddress = deepFindString(candidates, ["roadAddress", "roadAddr", "newAddress"]) ?? undefined;
 
-  // description: "방문자리뷰/블로그리뷰" 같은 문구면 소개로 대체 시도
   let description =
     deepFindString(candidates, ["intro", "summary", "description", "desc"]) ??
     (ogDesc && !isUselessDesc(ogDesc) ? ogDesc : undefined);
 
   if (description && looksLikeReviewCountLine(description)) {
     const alt =
-      deepFindString(candidates, ["introduction", "about", "bizIntro", "placeIntro", "homeDescription"]) ??
-      undefined;
+      deepFindString(candidates, ["introduction", "about", "bizIntro", "placeIntro", "homeDescription"]) ?? undefined;
     if (alt) description = alt;
   }
 
-  // tags/keywords
   const tags = extractTags(candidates);
 
-  // menus/services/price list
-  const menus = extractMenusEnhanced(candidates);
+  // ✅ 핵심: menus는 일반 candidates 말고 “queryDatas”를 우선적으로, 더 공격적으로 추출
+  const menus =
+    extractMenusFromQueries(queryDatas) // 1순위
+    .concat(extractMenusEnhanced(candidates)); // 2순위(기존 방식)
 
-  // reviews/rating/photoCount
+  const dedupMenus = dedupMenu(menus);
+
   const visitorCount =
     deepFindNumber(candidates, ["visitorReviewCount", "visitorReviews", "reviewCount", "userReviewCount"]) ?? undefined;
 
-  const blogCount =
-    deepFindNumber(candidates, ["blogReviewCount", "blogReviews"]) ?? undefined;
+  const blogCount = deepFindNumber(candidates, ["blogReviewCount", "blogReviews"]) ?? undefined;
 
-  const rating =
-    deepFindNumber(candidates, ["rating", "averageRating", "starRating", "score"]) ?? undefined;
+  const rating = deepFindNumber(candidates, ["rating", "averageRating", "starRating", "score"]) ?? undefined;
 
   const photoCountFromKeys =
     deepFindNumber(candidates, ["photoCount", "imageCount", "totalPhotoCount", "totalImages"]) ?? undefined;
@@ -107,7 +112,7 @@ export function parsePlaceFromHtml(html: string, placeUrl: string) {
     description,
     directions: undefined,
     tags: tags.length ? tags : undefined,
-    menus: menus.length ? menus : undefined,
+    menus: dedupMenus.length ? dedupMenus : undefined,
     reviews: {
       visitorCount,
       blogCount,
@@ -120,15 +125,9 @@ export function parsePlaceFromHtml(html: string, placeUrl: string) {
 }
 
 function cleanupName(n: string) {
-  // "파인트리 ... : 네이버" / 특수문자(\u001c) 제거
-  return n
-    .replace(/\s*:\s*네이버.*$/i, "")
-    .replace(/\u001c/g, "")
-    .trim();
+  return n.replace(/\s*:\s*네이버.*$/i, "").replace(/\u001c/g, "").trim();
 }
-
 function looksLikeReviewCountLine(s: string) {
-  // "방문자리뷰 1,927 · 블로그리뷰 393" 같은 패턴
   return /방문자리뷰|블로그리뷰|리뷰\s*\d+/i.test(s);
 }
 
@@ -145,7 +144,6 @@ function isUselessTitle(t?: string | null) {
   const x = t.trim();
   return x === "네이버 플레이스" || x === "Naver Place" || x.length <= 1;
 }
-
 function isUselessDesc(t?: string | null) {
   if (!t) return true;
   const x = t.trim();
@@ -160,7 +158,6 @@ function deepFindString(objs: any[], keys: string[]): string | null {
   }
   return null;
 }
-
 function deepFindNumber(objs: any[], keys: string[]): number | null {
   for (const key of keys) {
     const v = deepFindByKey(objs, key);
@@ -177,9 +174,8 @@ function deepFindByKey(objs: any[], key: string): any {
   }
   return undefined;
 }
-
 function deepFindInObject(obj: any, key: string, depth: number): any {
-  if (!obj || depth > 10) return undefined;
+  if (!obj || depth > 12) return undefined;
 
   if (typeof obj === "object") {
     if (Object.prototype.hasOwnProperty.call(obj, key)) return obj[key];
@@ -207,7 +203,6 @@ function asNonEmptyString(v: any): string | null {
   }
   return null;
 }
-
 function asNumber(v: any): number | null {
   if (typeof v === "number" && Number.isFinite(v)) return v;
   if (typeof v === "string") {
@@ -222,7 +217,6 @@ function asNumber(v: any): number | null {
 function extractTags(objs: any[]): string[] {
   const out = new Set<string>();
   const keys = ["tags", "keywords", "hashTags", "themeTags", "services", "serviceTags", "facilities"];
-
   for (const k of keys) {
     const v = deepFindByKey(objs, k);
     if (Array.isArray(v)) {
@@ -236,11 +230,71 @@ function extractTags(objs: any[]): string[] {
 }
 
 /**
- * ✅ 미용실/서비스업은 menus가 priceList/priceItems/services/treatments 등으로 들어있는 경우가 많음
+ * ✅ queryDatas에서 메뉴를 직접 찾는 로직
+ * - q.state.data 안에 price/service/treatment 배열이 들어있는 케이스 대응
  */
-function extractMenusEnhanced(objs: any[]): MenuItem[] {
+function extractMenusFromQueries(queryDatas: any[]): MenuItem[] {
   const out: MenuItem[] = [];
 
+  // menus가 들어있을 법한 키들
+  const keys = [
+    "priceList", "priceLists", "priceItems", "prices",
+    "serviceItems", "services", "treatments", "treatmentItems",
+    "menu", "menus", "items",
+    "bookingProducts", "products"
+  ];
+
+  for (const data of queryDatas) {
+    if (!data) continue;
+
+    // 1) 키 기반 추출
+    for (const k of keys) {
+      const v = deepFindByKey([data], k);
+      if (Array.isArray(v)) out.push(...menuFromAny(v));
+      else if (v && typeof v === "object") {
+        const maybeArr = v.items ?? v.list ?? v.elements ?? v.data ?? v.sections ?? undefined;
+        if (Array.isArray(maybeArr)) out.push(...menuFromAny(maybeArr));
+      }
+    }
+
+    // 2) “배열 중에 name+price 비슷한 구조”를 통째로 훑는 fallback
+    const foundArrays = collectArrays(data, 0);
+    for (const arr of foundArrays) {
+      // 너무 짧으면 스킵
+      if (arr.length < 2) continue;
+
+      // 샘플 3개를 보고 menu 가능성 체크
+      const sample = arr.slice(0, 3);
+      const ok = sample.some((it: any) => asNonEmptyString(it?.name ?? it?.title ?? it?.menuName ?? it?.serviceName)) &&
+                 sample.some((it: any) => asNumber(it?.price ?? it?.minPrice ?? it?.maxPrice ?? it?.amount ?? it?.value));
+      if (!ok) continue;
+
+      out.push(...menuFromAny(arr));
+    }
+  }
+
+  return out;
+}
+
+function collectArrays(obj: any, depth: number): any[][] {
+  if (!obj || depth > 10) return [];
+  const out: any[][] = [];
+
+  if (Array.isArray(obj)) {
+    out.push(obj);
+    for (const it of obj) out.push(...collectArrays(it, depth + 1));
+    return out;
+  }
+
+  if (typeof obj === "object") {
+    for (const k of Object.keys(obj)) out.push(...collectArrays(obj[k], depth + 1));
+  }
+
+  return out;
+}
+
+function extractMenusEnhanced(objs: any[]): MenuItem[] {
+  const out: MenuItem[] = [];
   const menuKeys = [
     "menus", "menu", "items",
     "priceList", "priceLists", "priceItems", "prices",
@@ -252,19 +306,11 @@ function extractMenusEnhanced(objs: any[]): MenuItem[] {
     const v = deepFindByKey(objs, key);
     if (Array.isArray(v)) out.push(...menuFromAny(v));
     else if (v && typeof v === "object") {
-      // object 안에 array가 들어있는 경우
-      const maybeArr =
-        v.items ?? v.list ?? v.elements ?? v.sections ?? v.data ?? undefined;
+      const maybeArr = v.items ?? v.list ?? v.elements ?? v.sections ?? v.data ?? undefined;
       if (Array.isArray(maybeArr)) out.push(...menuFromAny(maybeArr));
     }
   }
-
-  const dedup = new Map<string, MenuItem>();
-  for (const m of out) {
-    if (!m?.name) continue;
-    if (!dedup.has(m.name)) dedup.set(m.name, m);
-  }
-  return Array.from(dedup.values()).slice(0, 30);
+  return out;
 }
 
 function menuFromAny(arr: any[]): MenuItem[] {
@@ -289,8 +335,25 @@ function menuFromAny(arr: any[]): MenuItem[] {
   return out;
 }
 
+function dedupMenu(menus: MenuItem[]): MenuItem[] {
+  const seen = new Map<string, MenuItem>();
+
+  for (const m of menus) {
+    const name = (m?.name || "").trim();
+    if (!name) continue;
+    if (!/[가-힣A-Za-z]/.test(name)) continue;
+
+    // 미용실 기준 너무 작은 가격은 제외
+    if (typeof m.price === "number" && m.price < 5000) continue;
+
+    const key = `${name}:${m.price ?? "na"}`;
+    if (!seen.has(key)) seen.set(key, m);
+  }
+
+  return Array.from(seen.values()).slice(0, 30);
+}
+
 function estimatePhotoCountFromArrays(objs: any[]): number | null {
-  // 흔한 사진 배열 키에서 길이를 추정
   const keys = ["photos", "photoList", "images", "imageList", "media", "gallery"];
   let best = 0;
 
@@ -302,6 +365,5 @@ function estimatePhotoCountFromArrays(objs: any[]): number | null {
       if (Array.isArray(maybeArr)) best = Math.max(best, maybeArr.length);
     }
   }
-
   return best > 0 ? best : null;
 }
