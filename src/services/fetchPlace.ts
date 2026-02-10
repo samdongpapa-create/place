@@ -11,20 +11,107 @@ function hasNextData(html: string) {
   return /id="__NEXT_DATA__"/i.test(html);
 }
 
-function looksBlocked(html: string) {
-  // 네이버가 가끔 주는 차단/에러 패턴(완벽할 필요 없음)
+function extractBuildIdFromShell(html: string): string | null {
+  // Next.js buildId는 보통 이런 형태로 shell에 박혀 있음:
+  // /_next/static/<BUILDID>/_buildManifest.js
+  const m = html.match(/\/_next\/static\/([^\/]+)\/_buildManifest\.js/i);
+  return m?.[1] ?? null;
+}
+
+function toRoutePath(placeUrl: string): string | null {
+  // placeUrl 예: https://m.place.naver.com/hairshop/1443688242/home
+  // route: hairshop/1443688242/home
+  try {
+    const u = new URL(placeUrl);
+    const path = u.pathname.replace(/^\/+/, ""); // leading slash 제거
+    if (!path) return null;
+    return path;
+  } catch {
+    return null;
+  }
+}
+
+function wrapAsNextDataHtml(nextDataJson: any): string {
+  // 기존 enrichPlace의 guessMenusFromNextData(html) 가 그대로 먹도록
+  const safe = JSON.stringify(nextDataJson);
+  return `<!doctype html><html><head></head><body><script id="__NEXT_DATA__" type="application/json">${safe}</script></body></html>`;
+}
+
+function looksDefinitelyCaptchaOrBlock(html: string) {
   const t = html.toLowerCase();
+  // ✅ “진짜” 차단/보안문자 관련 키워드만
   return (
     t.includes("captcha") ||
-    t.includes("로봇") ||
-    t.includes("비정상") ||
+    t.includes("보안문자") ||
+    t.includes("자동입력") ||
+    t.includes("비정상적인 접근") ||
     t.includes("접근이 제한") ||
-    t.includes("error") && t.includes("naver")
+    t.includes("로봇이") ||
+    t.includes("robot") ||
+    t.includes("blocked")
   );
 }
 
 async function sleep(ms: number) {
   await new Promise((r) => setTimeout(r, ms));
+}
+
+async function fetchText(url: string, headers: Record<string, string>, timeoutMs: number) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const res = await fetch(url, {
+      method: "GET",
+      headers,
+      redirect: "follow",
+      signal: controller.signal
+    });
+
+    const text = await res.text();
+    const finalUrl = (res as any).url || url;
+
+    if (!res.ok) {
+      throw new Error(`fetch failed: ${res.status} ${res.statusText}\n${text.slice(0, 400)}`);
+    }
+
+    return { text, finalUrl };
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function tryFetchNextDataJsonFromShell(params: {
+  html: string;
+  placeUrl: string;
+  headers: Record<string, string>;
+  timeoutMs: number;
+}): Promise<{ html: string; finalUrl: string } | null> {
+  const { html, placeUrl, headers, timeoutMs } = params;
+
+  const buildId = extractBuildIdFromShell(html);
+  const route = toRoutePath(placeUrl);
+
+  if (!buildId || !route) return null;
+
+  // Next.js data URL
+  const nextUrl = `https://m.place.naver.com/_next/data/${buildId}/${route}.json`;
+
+  try {
+    const { text, finalUrl } = await fetchText(nextUrl, {
+      ...headers,
+      Accept: "application/json, text/plain, */*",
+      Referer: placeUrl
+    }, timeoutMs);
+
+    // JSON 파싱
+    const json = JSON.parse(text);
+
+    // 기존 파서가 먹도록 __NEXT_DATA__로 감싸서 HTML로 리턴
+    return { html: wrapAsNextDataHtml(json), finalUrl };
+  } catch {
+    return null;
+  }
 }
 
 export async function fetchPlaceHtml(placeUrl: string, opts: FetchOptions = {}): Promise<FetchedPage> {
@@ -34,7 +121,7 @@ export async function fetchPlaceHtml(placeUrl: string, opts: FetchOptions = {}):
   const timeoutMs = typeof opts.timeoutMs === "number" ? opts.timeoutMs : 9000;
   const retries = typeof opts.retries === "number" ? opts.retries : 1;
 
-  // ✅ UA 2종: iPhone(Safari) -> Desktop(Chrome) 순서로 스위치
+  // ✅ UA 2종: iPhone(Safari) -> Desktop(Chrome)
   const userAgents = [
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -55,46 +142,52 @@ export async function fetchPlaceHtml(placeUrl: string, opts: FetchOptions = {}):
       "Upgrade-Insecure-Requests": "1"
     };
 
-    const controller = new AbortController();
-    const t = setTimeout(() => controller.abort(), timeoutMs);
-
     try {
-      const res = await fetch(placeUrl, {
-        method: "GET",
-        headers,
-        redirect: "follow",
-        signal: controller.signal
-      });
+      const { text: htmlRaw, finalUrl } = await fetchText(placeUrl, headers, timeoutMs);
 
-      const html = await res.text();
-      const finalUrl = (res as any).url || placeUrl;
-
-      if (!res.ok) {
-        // 403/429는 재시도 가치가 큼
-        throw new Error(`fetchPlaceHtml failed: ${res.status} ${res.statusText}\n${html.slice(0, 400)}`);
-      }
-
-      // ✅ 너무 짧아도 __NEXT_DATA__가 있으면 통과 (메뉴/사진 데이터는 보통 여기 들어있음)
-      if (html.length < minLength && !hasNextData(html)) {
+      // 1) 진짜 캡차/차단이면 그때만 재시도 가치
+      if (looksDefinitelyCaptchaOrBlock(htmlRaw)) {
         throw new Error(
-          `fetchPlaceHtml got too-small html (${html.length}). minLength=${minLength}\nfinalUrl=${finalUrl}\nhead=${html.slice(0, 200)}`
+          `fetchPlaceHtml blocked/captcha (definite).\nfinalUrl=${finalUrl}\nhead=${htmlRaw.slice(0, 400)}`
         );
       }
 
-      // ✅ 차단/캡차로 보이면 다음 attempt에서 UA 바꿔 재시도
-      if (looksBlocked(html)) {
-        throw new Error(`fetchPlaceHtml looks blocked/captcha.\nfinalUrl=${finalUrl}\nhead=${html.slice(0, 300)}`);
+      // 2) __NEXT_DATA__가 있으면 길이 상관없이 통과
+      if (hasNextData(htmlRaw)) {
+        return { html: htmlRaw, finalUrl };
       }
 
-      return { html, finalUrl };
+      // 3) __NEXT_DATA__가 없고, HTML이 짧거나(또는 shell로 보이면)
+      //    shell에서 buildId 뽑아서 /_next/data JSON을 직접 가져와본다.
+      if (htmlRaw.length < minLength) {
+        const nextData = await tryFetchNextDataJsonFromShell({
+          html: htmlRaw,
+          placeUrl,
+          headers,
+          timeoutMs
+        });
+        if (nextData) return nextData;
+
+        // next-data도 실패하면 길이 기준 에러
+        throw new Error(
+          `fetchPlaceHtml got too-small html (${htmlRaw.length}). minLength=${minLength}\nfinalUrl=${finalUrl}\nhead=${htmlRaw.slice(0, 250)}`
+        );
+      }
+
+      // 4) 길이는 충분하지만 __NEXT_DATA__가 없는 케이스도 있음 → next-data 한번 더 시도
+      const nextData2 = await tryFetchNextDataJsonFromShell({
+        html: htmlRaw,
+        placeUrl,
+        headers,
+        timeoutMs
+      });
+      if (nextData2) return nextData2;
+
+      // 5) 그냥 HTML 반환(일부 파서가 본문 텍스트에서 뽑을 수도 있음)
+      return { html: htmlRaw, finalUrl };
     } catch (e: any) {
       lastErr = e;
-      clearTimeout(t);
-
-      // 재시도 전 짧게 쉬기(429 방지)
       if (attempt < retries) await sleep(350 + attempt * 250);
-    } finally {
-      clearTimeout(t);
     }
   }
 
