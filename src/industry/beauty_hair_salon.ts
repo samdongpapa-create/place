@@ -1,4 +1,4 @@
-import { IndustryProfile } from "./profile";
+import type { IndustryProfile } from "./profile.js";
 
 export const BEAUTY_HAIR_SALON: IndustryProfile = {
   subcategory: "beauty_hair_salon",
@@ -18,7 +18,12 @@ export const BEAUTY_HAIR_SALON: IndustryProfile = {
     "클리닉", "두피", "레이어드", "허쉬컷"
   ],
 
-  descriptionTemplate: ({ name, region, services, trust, cta }) => `
+  descriptionTemplate: (ctx) => {
+    const { name, region, services, trust, cta } = ctx;
+    const s = services.length ? services : ["커트", "염색", "펌"];
+    const t = trust.length ? trust : ["모질/두상 기반 상담", "손질 쉬운 스타일 설계", "시술 후 유지관리 안내"];
+
+    return `
 ${region}에서 헤어 스타일 상담부터 시술까지 꼼꼼하게 진행하는 ${name}입니다.
 
 이런 분들께 잘 맞아요
@@ -27,15 +32,16 @@ ${region}에서 헤어 스타일 상담부터 시술까지 꼼꼼하게 진행�
 - 집에서도 손질 쉬운 스타일을 원하는 분
 
 대표 시술
-- ${services.join("\n- ")}
+- ${s.join("\n- ")}
 
 시술 포인트
-- ${trust.join("\n- ")}
+- ${t.join("\n- ")}
 
 ${cta}
-`.trim(),
+`.trim();
+  },
 
-  directionsTemplate: (region) => `
+  directionsTemplate: (region: string) => `
 ${region} 기준으로 안내드립니다.
 
 - ○○역 ○번 출구 → 도보 ○분
@@ -43,13 +49,6 @@ ${region} 기준으로 안내드립니다.
 - 예약 시간 5분 전 도착 권장
 `.trim(),
 
-  photoChecklist: [
-    "외관",
-    "내부",
-    "시술 공간",
-    "전/후 스타일",
-    "가격표"
-  ],
-
+  photoChecklist: ["외관", "내부", "시술 공간", "전/후 스타일", "가격표"],
   bannedPhrases: ["100% 만족", "무조건 성공"]
 };
