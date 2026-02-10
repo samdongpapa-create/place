@@ -22,7 +22,15 @@ function asNumber(v: any): number | null {
 }
 
 function looksHairService(name: string) {
-  return /(커트|컷|펌|염색|클리닉|두피|뿌리|매직|볼륨|드라이|셋팅|탈색|톤다운|컬러|다운펌|열펌|디자인)/i.test(name);
+  return /(커트|컷|펌|염색|클리닉|두피|뿌리|매직|볼륨|드라이|셋팅|탈색|톤다운|컬러|다운펌|열펌|디자인펌|헤드스파)/i.test(name);
+}
+
+// ✅ 디자이너/스태프 프로필 감지
+function looksLikeStaffName(name: string) {
+  return /(디자이너|원장|실장|팀장|디렉터|매니저|아티스트)/i.test(name);
+}
+function looksLikeProfileNote(note: string) {
+  return /(Diploma|수상|경력|선정|아카데미|교육강사|ambassador|Specialist|Colorlist|Expert)/i.test(note);
 }
 
 function hasNumberDeep(obj: any, depth = 0): boolean {
@@ -63,6 +71,12 @@ function normalizeFromItem(it: any): Menu | null {
 
   if (!name) return null;
 
+  const note = asString(it?.note ?? it?.desc ?? it?.description ?? it?.memo) ?? undefined;
+
+  // ✅ 스태프/프로필이면 메뉴에서 제외
+  if (looksLikeStaffName(name)) return null;
+  if (note && looksLikeProfileNote(note)) return null;
+
   const rawPrice =
     it?.price ??
     it?.minPrice ??
@@ -80,7 +94,9 @@ function normalizeFromItem(it: any): Menu | null {
 
   const price = asNumber(rawPrice) ?? undefined;
   const durationMin = asNumber(it?.durationMin ?? it?.duration ?? it?.time ?? it?.leadTime) ?? undefined;
-  const note = asString(it?.note ?? it?.desc ?? it?.description ?? it?.memo) ?? undefined;
+
+  // ✅ 미용 서비스 단어가 전혀 없고, 가격/시간도 없으면 후보에서 제외(오탐 방지)
+  if (!looksHairService(name) && typeof price !== "number" && typeof durationMin !== "number") return null;
 
   return { name, ...(typeof price === "number" ? { price } : {}), ...(durationMin ? { durationMin } : {}), ...(note ? { note } : {}) };
 }
@@ -98,34 +114,43 @@ function dedup(menus: Menu[]) {
 }
 
 /**
- * ✅ 응답 JSON에서 “메뉴로 보이는 배열”을 키 이름에 의존하지 않고 찾아냄
- * - hair 키워드 포함된 name 우선
- * - price가 깊숙이 있어도 ok (hasNumberDeep)
+ * ✅ 키에 의존하지 않고 “메뉴 배열”을 찾되,
+ * - staff/profiles 오탐을 강하게 제거
+ * - hair keyword 있는 name 우선
  */
 function extractMenusHeuristic(json: any): Menu[] {
-  const out: Menu[] = [];
-
+  const candidates: Menu[] = [];
   const arrays = collectArrays(json, 0);
+
   for (const arr of arrays) {
     if (!Array.isArray(arr) || arr.length < 2) continue;
 
-    // 샘플 기반: name 비슷한 필드가 있고, 숫자가 어딘가에 존재하면 메뉴 후보
-    const sample = arr.slice(0, 5);
+    const sample = arr.slice(0, 6);
+
+    // name-like 필드가 있는지
     const hasName = sample.some((it) => asString(it?.name ?? it?.title ?? it?.menuName ?? it?.serviceName ?? it?.productName ?? it?.itemName));
+    if (!hasName) continue;
+
+    // 숫자(가격/시간 등)가 어딘가에 존재하는지
     const hasAnyNumber = sample.some((it) => hasNumberDeep(it));
-    if (!hasName || !hasAnyNumber) continue;
+    // booking 쪽은 가격이 없을 수도 있어서, 숫자가 없으면 hair 키워드로 대신 통과
+    const hasHairKeyword = sample.some((it) => {
+      const nm = asString(it?.name ?? it?.title ?? it?.menuName ?? it?.serviceName ?? it?.productName ?? it?.itemName);
+      return nm ? looksHairService(nm) : false;
+    });
+
+    if (!hasAnyNumber && !hasHairKeyword) continue;
 
     for (const it of arr) {
       const m = normalizeFromItem(it);
-      if (m) out.push(m);
+      if (m) candidates.push(m);
     }
   }
 
-  // hair 관련 name 우선
-  const hair = out.filter((m) => looksHairService(m.name));
-  if (hair.length >= 3) return dedup(hair);
+  const hair = candidates.filter((m) => looksHairService(m.name));
+  if (hair.length) return dedup(hair);
 
-  return dedup(out);
+  return dedup(candidates);
 }
 
 function topKeys(obj: any): string[] {
@@ -141,7 +166,6 @@ export async function fetchMenusViaPlaywright(targetUrl: string) {
     capturedOps: [] as { url: string; operationName?: string; variablesKeys?: string[] }[],
     jsonResponses: 0,
     menusFound: 0,
-    // ✅ 응답 구조 힌트(상위 키/배열 후보 수)
     capturedGraphqlSamples: [] as { url: string; topKeys: string[]; hasDataKey: boolean; arraysFound: number }[]
   };
 
@@ -175,9 +199,7 @@ export async function fetchMenusViaPlaywright(targetUrl: string) {
             const op = parsed?.operationName;
             const vars = parsed?.variables && typeof parsed.variables === "object" ? Object.keys(parsed.variables) : [];
             debug.capturedOps.push({ url, operationName: op, variablesKeys: vars });
-          } catch {
-            // ignore
-          }
+          } catch {}
         }
       }
     });
@@ -186,17 +208,15 @@ export async function fetchMenusViaPlaywright(targetUrl: string) {
       try {
         const url = res.url();
         const ct = (res.headers()["content-type"] || "").toLowerCase();
-
-        const urlHit = /graphql/i.test(url);
-        const jsonHit = ct.includes("application/json") || ct.includes("application/graphql-response+json");
-        if (!urlHit || !jsonHit) return;
+        const isGraphql = /graphql/i.test(url);
+        const isJson = ct.includes("application/json") || ct.includes("application/graphql-response+json");
+        if (!isGraphql || !isJson) return;
 
         const data = await res.json().catch(() => null);
         if (!data) return;
 
         debug.jsonResponses++;
 
-        // 구조 힌트 저장(너가 다음 단계에서 “내부 API 콜”로 갈 때 결정적)
         debug.capturedGraphqlSamples.push({
           url,
           topKeys: topKeys(data),
@@ -206,14 +226,11 @@ export async function fetchMenusViaPlaywright(targetUrl: string) {
 
         const found = extractMenusHeuristic(data);
         if (found.length) menus.push(...found);
-      } catch {
-        // ignore
-      }
+      } catch {}
     });
 
     await page.goto(targetUrl, { waitUntil: "networkidle", timeout: 25000 });
 
-    // 예약 페이지는 스크롤로 추가 호출이 잘 일어남
     try {
       await page.mouse.wheel(0, 1400);
       await page.waitForTimeout(1200);
