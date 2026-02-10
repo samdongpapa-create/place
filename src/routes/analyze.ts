@@ -1,3 +1,4 @@
+// src/routes/analyze.ts
 import { Router } from "express";
 import { analyzeRequestSchema } from "../core/validate.js";
 
@@ -26,26 +27,27 @@ router.post("/analyze", async (req, res) => {
   const requestId = `req_${Date.now().toString(36)}`;
 
   try {
-    // 1) URL 확정 (biz_search면 내부에서 placeUrl 만들어주는 구조라고 가정)
+    // 1) 입력 URL 정규화(일단 place/home로 맞춤)
     const resolved = await resolvePlace(input as any, options as any);
 
-    // 2) HTML fetch & parse
-    const html = await fetchPlaceHtml(resolved.placeUrl);
-    const rawPlace = parsePlaceFromHtml(html, resolved.placeUrl);
+    // 2) HTML fetch (리다이렉트 최종 URL까지 받음)
+    const fetched = await fetchPlaceHtml(resolved.placeUrl);
 
-    // 3) normalize
-    const place = normalizePlace(rawPlace);
+    // 3) 파싱은 최종 URL 기준으로
+    const rawPlace = parsePlaceFromHtml(fetched.html, fetched.finalUrl);
 
-    // 4) 업종 자동분류
+    // 4) normalize
+    const place = normalizePlace({
+      ...rawPlace,
+      placeUrl: fetched.finalUrl
+    });
+
+    // 5) 업종 자동분류
     const industry = autoClassifyIndustry(place);
 
-    // 5) 점수(Vertical)
+    // 6) 점수/추천
     const scores = scorePlace(place, industry.vertical);
-
-    // 6) 추천(세부 업종)
     const recommendRaw = recommendForPlace(place, scores, industry.subcategory);
-
-    // 7) 무료/유료 마스킹
     const recommend = applyPlanToRecommend(options.plan, recommendRaw);
 
     return res.json({
@@ -53,7 +55,8 @@ router.post("/analyze", async (req, res) => {
         requestId,
         mode: input.mode,
         plan: options.plan,
-        placeUrl: resolved.placeUrl,
+        placeUrl: fetched.finalUrl,             // ✅ 최종 URL
+        resolvedFrom: resolved.placeUrl,        // ✅ 정규화된 원본(디버그용)
         resolvedConfidence: resolved.confidence ?? null,
         fetchedAt: new Date().toISOString()
       },
