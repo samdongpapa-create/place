@@ -1,11 +1,15 @@
 // src/services/playwrightMenus.ts
 import { chromium } from "playwright";
 
-// ✅ 이 줄이 핵심: Menu를 export 해야 enrichPlace에서 type import 가능
 export type Menu = { name: string; price?: number; durationMin?: number; note?: string };
 
-// ... 이하 기존 코드 그대로 ...
-
+function asString(v: any): string | null {
+  if (typeof v === "string") {
+    const s = v.trim();
+    return s ? s : null;
+  }
+  return null;
+}
 function asNumber(v: any): number | null {
   if (typeof v === "number" && Number.isFinite(v)) return v;
   if (typeof v === "string") {
@@ -16,12 +20,18 @@ function asNumber(v: any): number | null {
   }
   return null;
 }
-function asString(v: any): string | null {
-  if (typeof v === "string") {
-    const s = v.trim();
-    return s ? s : null;
-  }
-  return null;
+
+function looksHairService(name: string) {
+  return /(커트|컷|펌|염색|클리닉|두피|뿌리|매직|볼륨|드라이|셋팅|탈색|톤다운|컬러|다운펌|열펌|디자인)/i.test(name);
+}
+
+function hasNumberDeep(obj: any, depth = 0): boolean {
+  if (!obj || depth > 6) return false;
+  if (typeof obj === "number" && Number.isFinite(obj)) return true;
+  if (typeof obj === "string") return /\d/.test(obj);
+  if (Array.isArray(obj)) return obj.some((x) => hasNumberDeep(x, depth + 1));
+  if (typeof obj === "object") return Object.values(obj).some((x) => hasNumberDeep(x, depth + 1));
+  return false;
 }
 
 function collectArrays(obj: any, depth = 0): any[][] {
@@ -38,74 +48,101 @@ function collectArrays(obj: any, depth = 0): any[][] {
   return out;
 }
 
-function extractMenusFromJson(obj: any): Menu[] {
-  const arrays = collectArrays(obj, 0);
+function normalizeFromItem(it: any): Menu | null {
+  const name =
+    asString(
+      it?.name ??
+        it?.title ??
+        it?.menuName ??
+        it?.serviceName ??
+        it?.productName ??
+        it?.itemName ??
+        it?.displayName ??
+        it
+    ) ?? null;
 
-  const scored: { arr: any[]; score: number }[] = [];
+  if (!name) return null;
 
-  for (const arr of arrays) {
-    if (!Array.isArray(arr) || arr.length < 3 || arr.length > 2000) continue;
+  const rawPrice =
+    it?.price ??
+    it?.minPrice ??
+    it?.maxPrice ??
+    it?.amount ??
+    it?.value ??
+    it?.cost ??
+    it?.priceValue ??
+    it?.salePrice ??
+    it?.discountPrice ??
+    it?.originPrice ??
+    it?.priceInfo?.price ??
+    it?.priceInfo?.amount ??
+    it?.price?.value;
 
-    const sample = arr.slice(0, 40);
-    let hasName = 0;
-    let hasPrice = 0;
+  const price = asNumber(rawPrice) ?? undefined;
+  const durationMin = asNumber(it?.durationMin ?? it?.duration ?? it?.time ?? it?.leadTime) ?? undefined;
+  const note = asString(it?.note ?? it?.desc ?? it?.description ?? it?.memo) ?? undefined;
 
-    for (const it of sample) {
-      const n = asString(it?.name ?? it?.title ?? it?.menuName ?? it?.serviceName ?? it?.productName ?? it?.itemName);
-      if (n) hasName++;
+  return { name, ...(typeof price === "number" ? { price } : {}), ...(durationMin ? { durationMin } : {}), ...(note ? { note } : {}) };
+}
 
-      const p = asNumber(it?.price ?? it?.minPrice ?? it?.maxPrice ?? it?.amount ?? it?.value ?? it?.cost ?? it?.priceValue);
-      if (typeof p === "number" && p >= 5000 && p <= 2000000) hasPrice++;
-    }
-
-    if (hasName < 3 || hasPrice < 2) continue;
-    scored.push({ arr, score: hasName * 2 + hasPrice * 3 });
-  }
-
-  scored.sort((a, b) => b.score - a.score);
-
-  const out: Menu[] = [];
-  for (const c of scored.slice(0, 6)) {
-    for (const it of c.arr) {
-      const name = asString(it?.name ?? it?.title ?? it?.menuName ?? it?.serviceName ?? it?.productName ?? it?.itemName);
-      if (!name) continue;
-
-      const rawPrice = it?.price ?? it?.minPrice ?? it?.maxPrice ?? it?.amount ?? it?.value ?? it?.cost ?? it?.priceValue;
-      const price = asNumber(rawPrice) ?? undefined;
-
-      const durationMin = asNumber(it?.durationMin ?? it?.duration ?? it?.time ?? it?.leadTime) ?? undefined;
-      const note = asString(it?.note ?? it?.desc ?? it?.description ?? it?.memo) ?? undefined;
-
-      if (typeof price === "number" && (price < 5000 || price > 2000000)) continue;
-
-      out.push({ name, ...(typeof price === "number" ? { price } : {}), ...(durationMin ? { durationMin } : {}), ...(note ? { note } : {}) });
-      if (out.length >= 60) break;
-    }
-    if (out.length >= 60) break;
-  }
-
-  // dedup
+function dedup(menus: Menu[]) {
   const seen = new Set<string>();
-  const dedup: Menu[] = [];
-  for (const m of out) {
+  const out: Menu[] = [];
+  for (const m of menus) {
     const key = `${m.name}:${m.price ?? "na"}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    dedup.push(m);
+    out.push(m);
   }
-  return dedup.slice(0, 30);
+  return out.slice(0, 40);
 }
 
 /**
- * ✅ Playwright로 /price 열고 XHR JSON 응답에서 menus 추출
- * - “가격표 API는 JS로만 호출되는” 케이스 100% 대응
+ * ✅ 응답 JSON에서 “메뉴로 보이는 배열”을 키 이름에 의존하지 않고 찾아냄
+ * - hair 키워드 포함된 name 우선
+ * - price가 깊숙이 있어도 ok (hasNumberDeep)
  */
-export async function fetchMenusViaPlaywright(priceUrl: string) {
+function extractMenusHeuristic(json: any): Menu[] {
+  const out: Menu[] = [];
+
+  const arrays = collectArrays(json, 0);
+  for (const arr of arrays) {
+    if (!Array.isArray(arr) || arr.length < 2) continue;
+
+    // 샘플 기반: name 비슷한 필드가 있고, 숫자가 어딘가에 존재하면 메뉴 후보
+    const sample = arr.slice(0, 5);
+    const hasName = sample.some((it) => asString(it?.name ?? it?.title ?? it?.menuName ?? it?.serviceName ?? it?.productName ?? it?.itemName));
+    const hasAnyNumber = sample.some((it) => hasNumberDeep(it));
+    if (!hasName || !hasAnyNumber) continue;
+
+    for (const it of arr) {
+      const m = normalizeFromItem(it);
+      if (m) out.push(m);
+    }
+  }
+
+  // hair 관련 name 우선
+  const hair = out.filter((m) => looksHairService(m.name));
+  if (hair.length >= 3) return dedup(hair);
+
+  return dedup(out);
+}
+
+function topKeys(obj: any): string[] {
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return [];
+  return Object.keys(obj).slice(0, 30);
+}
+
+export async function fetchMenusViaPlaywright(targetUrl: string) {
   const debug = {
     used: true,
+    targetUrl,
     capturedUrls: [] as string[],
+    capturedOps: [] as { url: string; operationName?: string; variablesKeys?: string[] }[],
     jsonResponses: 0,
-    menusFound: 0
+    menusFound: 0,
+    // ✅ 응답 구조 힌트(상위 키/배열 후보 수)
+    capturedGraphqlSamples: [] as { url: string; topKeys: string[]; hasDataKey: boolean; arraysFound: number }[]
   };
 
   const browser = await chromium.launch({
@@ -121,55 +158,73 @@ export async function fetchMenusViaPlaywright(priceUrl: string) {
     });
 
     const page = await context.newPage();
-
     const menus: Menu[] = [];
+
+    page.on("request", (req) => {
+      const url = req.url();
+      if (!/graphql|api|booking|reserve|price|menu/i.test(url)) return;
+
+      debug.capturedUrls.push(url);
+      if (debug.capturedUrls.length > 80) return;
+
+      if (/graphql/i.test(url) && req.method() === "POST") {
+        const post = req.postData();
+        if (post) {
+          try {
+            const parsed = JSON.parse(post);
+            const op = parsed?.operationName;
+            const vars = parsed?.variables && typeof parsed.variables === "object" ? Object.keys(parsed.variables) : [];
+            debug.capturedOps.push({ url, operationName: op, variablesKeys: vars });
+          } catch {
+            // ignore
+          }
+        }
+      }
+    });
 
     page.on("response", async (res) => {
       try {
         const url = res.url();
         const ct = (res.headers()["content-type"] || "").toLowerCase();
 
-        // JSON류 + 메뉴/가격 힌트 URL만 캡처
-        const urlHit = /price|menu|product|booking|service|treatment|graphql|api/i.test(url);
+        const urlHit = /graphql/i.test(url);
         const jsonHit = ct.includes("application/json") || ct.includes("application/graphql-response+json");
-
         if (!urlHit || !jsonHit) return;
-
-        debug.capturedUrls.push(url);
-        if (debug.capturedUrls.length > 40) return;
 
         const data = await res.json().catch(() => null);
         if (!data) return;
 
         debug.jsonResponses++;
 
-        const found = extractMenusFromJson(data);
-        if (found.length) {
-          for (const m of found) menus.push(m);
-        }
+        // 구조 힌트 저장(너가 다음 단계에서 “내부 API 콜”로 갈 때 결정적)
+        debug.capturedGraphqlSamples.push({
+          url,
+          topKeys: topKeys(data),
+          hasDataKey: !!data?.data,
+          arraysFound: collectArrays(data, 0).length
+        });
+
+        const found = extractMenusHeuristic(data);
+        if (found.length) menus.push(...found);
       } catch {
         // ignore
       }
     });
 
-    await page.goto(priceUrl, { waitUntil: "networkidle", timeout: 20000 });
+    await page.goto(targetUrl, { waitUntil: "networkidle", timeout: 25000 });
 
-    // networkidle 이후에도 추가 호출이 있을 수 있어서 짧게 버퍼
-    await page.waitForTimeout(1200);
+    // 예약 페이지는 스크롤로 추가 호출이 잘 일어남
+    try {
+      await page.mouse.wheel(0, 1400);
+      await page.waitForTimeout(1200);
+      await page.mouse.wheel(0, 1400);
+      await page.waitForTimeout(1200);
+    } catch {}
 
-    // dedup
-    const seen = new Set<string>();
-    const out: Menu[] = [];
-    for (const m of menus) {
-      const key = `${m.name}:${m.price ?? "na"}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      out.push(m);
-      if (out.length >= 30) break;
-    }
-
+    const out = dedup(menus);
     debug.menusFound = out.length;
-    return { menus: out, debug };
+
+    return { menus: out.slice(0, 30), debug };
   } finally {
     await browser.close();
   }
