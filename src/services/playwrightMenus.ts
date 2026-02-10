@@ -22,7 +22,9 @@ function asNumber(v: any): number | null {
 }
 
 function looksHairService(name: string) {
-  return /(커트|컷|펌|염색|클리닉|두피|뿌리|매직|볼륨|드라이|셋팅|탈색|톤다운|컬러|다운펌|열펌|디자인펌|헤드스파)/i.test(name);
+  return /(커트|컷|펌|염색|클리닉|두피|뿌리|매직|볼륨|드라이|셋팅|탈색|톤다운|컬러|다운펌|열펌|디자인펌|헤드스파)/i.test(
+    name
+  );
 }
 function looksLikeStaffName(name: string) {
   return /(디자이너|원장|실장|팀장|디렉터|매니저|아티스트)/i.test(name);
@@ -124,7 +126,9 @@ function extractMenusHeuristic(json: any): Menu[] {
     if (!Array.isArray(arr) || arr.length < 2) continue;
 
     const sample = arr.slice(0, 6);
-    const hasName = sample.some((it) => asString(it?.name ?? it?.title ?? it?.menuName ?? it?.serviceName ?? it?.productName ?? it?.itemName));
+    const hasName = sample.some((it) =>
+      asString(it?.name ?? it?.title ?? it?.menuName ?? it?.serviceName ?? it?.productName ?? it?.itemName)
+    );
     if (!hasName) continue;
 
     const hasAnyNumber = sample.some((it) => hasNumberDeep(it));
@@ -157,7 +161,11 @@ function keysPreview(x: any): string[] {
 }
 
 function safeJsonParse(s: string): any | null {
-  try { return JSON.parse(s); } catch { return null; }
+  try {
+    return JSON.parse(s);
+  } catch {
+    return null;
+  }
 }
 
 // ✅ 배치 응답([ {data...}, {data...} ])에서도 data 유무 판단
@@ -194,7 +202,13 @@ async function triggerPriceRequests(page: any) {
     '[role="button"]:has-text("닫기")'
   ];
   for (const sel of closeSelectors) {
-    try { await page.locator(sel).first().click({ timeout: 800 }).catch(() => {}); } catch {}
+    try {
+      await page
+        .locator(sel)
+        .first()
+        .click({ timeout: 800 })
+        .catch(() => {});
+    } catch {}
   }
 
   // 2) “가격표/시술/커트/펌/염색” 같은 칩/탭/버튼을 싹 클릭(존재하는 것만)
@@ -202,7 +216,8 @@ async function triggerPriceRequests(page: any) {
   for (const w of clickWords) {
     try {
       const loc = page.getByText(new RegExp(w)).first();
-      if (await loc.count().catch(() => 0)) {
+      const cnt = await loc.count().catch(() => 0);
+      if (cnt > 0) {
         await loc.click({ timeout: 900 }).catch(() => {});
         await page.waitForTimeout(500);
       }
@@ -221,7 +236,7 @@ async function triggerPriceRequests(page: any) {
 
   // 4) role=button / button을 무작정 몇 개 눌러서 로딩 트리거 (너무 과하면 위험하니 10개 제한)
   try {
-    const btns = page.locator('button, [role="button"]');
+    const btns = page.locator("button, [role=\"button\"]");
     const n = Math.min(await btns.count().catch(() => 0), 10);
     for (let i = 0; i < n; i++) {
       // 예약/공유 같은 버튼 오동작 방지: 텍스트가 너무 긴 건 스킵
@@ -241,24 +256,33 @@ async function triggerPriceRequests(page: any) {
     }
   } catch {}
 
-  // 내부 스크롤 컨테이너(있으면)도 강제로 내리기
+  // ✅ 내부 스크롤 컨테이너(있으면)도 강제로 내리기
+  // (Node TS 환경에서 DOM 전역(document/window/HTMLElement)을 직접 참조하면 빌드가 깨져서 globalThis + any로 처리)
   try {
     await page.evaluate(() => {
-      const els = Array.from(document.querySelectorAll<HTMLElement>("*"));
-      const scrollables = els.filter((el) => {
-        const style = window.getComputedStyle(el);
-        const oy = style.overflowY;
+      const doc: any = (globalThis as any).document;
+      const win: any = (globalThis as any).window;
+      if (!doc || !win) return;
+
+      const els = Array.from(doc.querySelectorAll("*")) as any[];
+
+      const scrollables = els.filter((el: any) => {
+        const style = win.getComputedStyle?.(el);
+        const oy = style?.overflowY;
         return (oy === "auto" || oy === "scroll") && el.scrollHeight > el.clientHeight + 200;
       });
-      scrollables.slice(0, 3).forEach((el) => (el.scrollTop = el.scrollHeight));
+
+      scrollables.slice(0, 3).forEach((el: any) => {
+        el.scrollTop = el.scrollHeight;
+      });
     });
+
     await page.waitForTimeout(900);
   } catch {}
 
   // 6) 추가 대기 (graphql 늦게 오기도 함)
   await page.waitForTimeout(1500);
 }
-
 
 export async function fetchMenusViaPlaywright(targetUrl: string) {
   const debug = {
