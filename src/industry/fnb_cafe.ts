@@ -1,4 +1,4 @@
-import { IndustryProfile } from "./profile";
+import type { IndustryProfile } from "./profile.js";
 
 export const FNB_CAFE: IndustryProfile = {
   subcategory: "fnb_cafe",
@@ -18,7 +18,12 @@ export const FNB_CAFE: IndustryProfile = {
     "콘센트", "와이파이", "좌석"
   ],
 
-  descriptionTemplate: ({ name, region, services, trust, cta }) => `
+  descriptionTemplate: (ctx) => {
+    const { name, region, services, trust, cta } = ctx;
+    const s = services.length ? services : ["아메리카노", "라떼", "디저트"];
+    const t = trust.length ? trust : ["좌석/동선이 편함", "메뉴 구성이 직관적", "체류 정보(콘센트/와이파이) 안내"];
+
+    return `
 ${region}에서 커피와 디저트를 편하게 즐길 수 있는 ${name}입니다.
 
 이런 분들께 추천드려요
@@ -27,15 +32,16 @@ ${region}에서 커피와 디저트를 편하게 즐길 수 있는 ${name}입니
 - 디저트도 함께 즐기고 싶은 분
 
 주요 메뉴
-- ${services.join("\n- ")}
+- ${s.join("\n- ")}
 
 매장 특징
-- ${trust.join("\n- ")}
+- ${t.join("\n- ")}
 
 ${cta}
-`.trim(),
+`.trim();
+  },
 
-  directionsTemplate: (region) => `
+  directionsTemplate: (region: string) => `
 ${region} 기준으로 안내드립니다.
 
 - ○○역 ○번 출구 → 도보 ○분
@@ -43,13 +49,6 @@ ${region} 기준으로 안내드립니다.
 - 주차 가능 여부는 방문 전 확인 권장
 `.trim(),
 
-  photoChecklist: [
-    "외관",
-    "내부 전경",
-    "대표 음료",
-    "디저트",
-    "좌석 구성"
-  ],
-
+  photoChecklist: ["외관", "내부 전경", "대표 음료", "디저트", "좌석 구성"],
   bannedPhrases: ["전국최고", "무조건 맛있음"]
 };
