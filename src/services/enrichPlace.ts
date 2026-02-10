@@ -149,6 +149,11 @@ function cleanMenus(menus: Menu[]): Menu[] {
     });
   }
 
+  import { scorePlace } from "./scorePlace.js";
+// ...
+const audit = scorePlace(place);
+return { ...place, ...audit };
+
   return out.slice(0, 30);
 }
 
