@@ -1,6 +1,6 @@
 import express from "express";
 import helmet from "helmet";
-import analyzeRouter from "./routes/analyze"; // ✅ .js 제거 (TS 빌드 안전)
+import { analyzeRouter } from "./routes/analyze.js"; // ✅ named import
 
 const app = express();
 
