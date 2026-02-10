@@ -1,7 +1,10 @@
 // src/services/playwrightMenus.ts
 import { chromium } from "playwright";
 
-type Menu = { name: string; price?: number; durationMin?: number; note?: string };
+// ✅ 이 줄이 핵심: Menu를 export 해야 enrichPlace에서 type import 가능
+export type Menu = { name: string; price?: number; durationMin?: number; note?: string };
+
+// ... 이하 기존 코드 그대로 ...
 
 function asNumber(v: any): number | null {
   if (typeof v === "number" && Number.isFinite(v)) return v;
