@@ -30,19 +30,16 @@ router.post("/analyze", async (req, res) => {
   try {
     const resolved = await resolvePlace(input as any, options as any);
 
+    // ✅ home은 기존대로 minLength(2000) 엄격 적용
     const fetched = await fetchPlaceHtml(resolved.placeUrl);
     const rawPlace = parsePlaceFromHtml(fetched.html, fetched.finalUrl);
 
-    let place = normalizePlace({
-      ...rawPlace,
-      placeUrl: fetched.finalUrl
-    });
+    let place = normalizePlace({ ...rawPlace, placeUrl: fetched.finalUrl }) as any;
 
-    // ✅ 추가 보강: /photo, /price(/menu)에서 더 채움 + directions 자동 생성
-    place = (await enrichPlace(place as any)) as any;
+    // ✅ /photo, /price는 minLength 완화 + 추정 로직
+    place = (await enrichPlace(place)) as any;
 
     const industry = autoClassifyIndustry(place);
-
     const scores = scorePlace(place, industry.vertical);
     const recommendRaw = recommendForPlace(place, scores, industry.subcategory);
     const recommend = applyPlanToRecommend(options.plan, recommendRaw);
