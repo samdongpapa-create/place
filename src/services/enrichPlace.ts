@@ -2,6 +2,7 @@
 import { fetchMenusViaPlaywright, type Menu } from "./playwrightMenus.js";
 import { fetchExistingKeywordsViaPlaywright } from "./playwrightKeywords.js";
 import { fetchRepresentativeKeywords5ByFrameSource } from "./playwrightKeywordList.js";
+import { scorePlace } from "./scorePlace.js";
 
 type PlaceProfileLike = {
   placeId?: string;
@@ -14,7 +15,7 @@ type PlaceProfileLike = {
   directions?: string;
   tags?: string[];
   keywords?: string[]; // ✅ 기존 대표키워드(원문 전체)
-  keywords5?: string[]; // ✅ 기존 대표키워드 5개(유료 전환용)
+  keywords5?: string[]; // ✅ 대표키워드 5개(유료 전환용)
   menus?: Menu[];
   reviews?: any;
   photos?: { count?: number };
@@ -22,43 +23,45 @@ type PlaceProfileLike = {
   _keywordDebug?: any;
 };
 
-export async function enrichPlace(place: PlaceProfileLike): Promise<PlaceProfileLike> {
+export async function enrichPlace(place: PlaceProfileLike): Promise<any> {
   const base = basePlaceUrl(place.placeUrl);
   const isHair = isHairSalon(place);
 
   // =========================
-  // 0) ✅ 기존 대표키워드(최우선)
-  //    1) "프레임 소스(keywordList)" 방식
-  //    2) 실패 시 기존 GraphQL/DOM 휴리스틱 폴백
+  // 0) ✅ 대표키워드(최우선)
+  //    A) frame source(keywordList) = 정답 루트
+  //    B) 실패 시 GraphQL/DOM 휴리스틱 폴백
   // =========================
   if (!place.keywords || place.keywords.length === 0) {
     const homeUrl = `${base}/home`;
 
-    // (A) frame source keywordList 파싱 (정답 루트)
+    // (A) frame source keywordList 파싱
     try {
       const kw = await fetchRepresentativeKeywords5ByFrameSource(homeUrl);
 
-      if (kw.raw?.length) {
+      if (kw?.raw?.length) {
         place.keywords = kw.raw.slice(0, 15);
-        place.keywords5 = kw.keywords5?.length ? kw.keywords5 : kw.raw.slice(0, 5);
+        place.keywords5 = (kw.keywords5?.length ? kw.keywords5 : kw.raw.slice(0, 5)).slice(0, 5);
       }
 
-      place._keywordDebug = { via: "frame-keywordList", ...kw.debug };
+      place._keywordDebug = { via: "frame-keywordList", ...(kw?.debug ?? {}) };
     } catch (e: any) {
       place._keywordDebug = { via: "frame-keywordList", error: e?.message ?? "keywordList parse failed" };
     }
 
-    // (B) 그래도 없으면 폴백 (GraphQL/DOM)
+    // (B) 폴백: GraphQL/DOM heuristic
     if (!place.keywords || place.keywords.length === 0) {
       try {
         const kw2 = await fetchExistingKeywordsViaPlaywright(homeUrl);
-        if (kw2.keywords?.length) {
+
+        if (kw2?.keywords?.length) {
           place.keywords = kw2.keywords.slice(0, 15);
           place.keywords5 = kw2.keywords.slice(0, 5);
         }
+
         place._keywordDebug = {
           ...(place._keywordDebug || {}),
-          fallback: { via: "graphql-dom-heuristic", ...kw2.debug }
+          fallback: { via: "graphql-dom-heuristic", ...(kw2?.debug ?? {}) }
         };
       } catch (e: any) {
         place._keywordDebug = {
@@ -68,7 +71,7 @@ export async function enrichPlace(place: PlaceProfileLike): Promise<PlaceProfile
       }
     }
   } else {
-    // keywords가 이미 있으면 5개도 맞춰줌
+    // 이미 keywords가 있으면 keywords5를 맞춰줌
     if (!place.keywords5 || place.keywords5.length === 0) {
       place.keywords5 = place.keywords.slice(0, 5);
     }
@@ -83,24 +86,30 @@ export async function enrichPlace(place: PlaceProfileLike): Promise<PlaceProfile
     try {
       const pw = await fetchMenusViaPlaywright(priceUrl);
 
-      if (pw.menus.length) {
+      if (pw?.menus?.length) {
         place.menus = cleanMenus(pw.menus);
-        place._menuDebug = { via: "hair-price-pw", isHair, ...pw.debug };
+        place._menuDebug = { via: "hair-price-pw", isHair, ...(pw?.debug ?? {}) };
       } else {
-        place._menuDebug = { via: "hair-none", isHair, ...pw.debug };
+        place._menuDebug = { via: "hair-none", isHair, ...(pw?.debug ?? {}) };
       }
     } catch (e: any) {
       place._menuDebug = { via: "hair-price-pw", isHair, error: e?.message ?? "price pw failed" };
     }
   }
 
-  return place;
+  // =========================
+  // 2) ✅ 점수화 + 추천키워드 + TODO
+  // =========================
+  const audit = scorePlace(place);
+
+  // 최종 응답: place + scores/recommend/todoTop5
+  return { ...place, ...audit };
 }
 
 function isHairSalon(place: PlaceProfileLike) {
   const c = (place.category || "").toLowerCase();
   const n = (place.name || "").toLowerCase();
-  return c.includes("미용실") || n.includes("헤어") || n.includes("hair");
+  return c.includes("미용실") || n.includes("헤어") || n.includes("hair") || c.includes("헤어");
 }
 
 function basePlaceUrl(url: string) {
@@ -148,11 +157,6 @@ function cleanMenus(menus: Menu[]): Menu[] {
       ...(it.note ? { note: it.note } : {})
     });
   }
-
-  import { scorePlace } from "./scorePlace.js";
-// ...
-const audit = scorePlace(place);
-return { ...place, ...audit };
 
   return out.slice(0, 30);
 }
