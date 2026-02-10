@@ -1,7 +1,7 @@
 // src/services/enrichPlace.ts
 import { fetchPlaceHtml } from "./fetchPlace.js";
 import { parsePlaceFromHtml } from "./parsePlace.js";
-import { tryFetchMenusInternal, type Menu as InternalMenu } from "./naverMenusInternal.js";
+import { fetchMenusViaPlaywright } from "./playwrightMenus.js";
 
 type Menu = { name: string; price?: number; durationMin?: number; note?: string };
 
@@ -18,7 +18,6 @@ type PlaceProfileLike = {
   menus?: Menu[];
   reviews?: any;
   photos?: { count?: number };
-  // ✅ debug용 (응답에서 meta.debug랑 같이 보기 쉬움)
   _menuDebug?: any;
 };
 
@@ -42,40 +41,39 @@ export async function enrichPlace(place: PlaceProfileLike): Promise<PlaceProfile
     } catch {}
   }
 
-  // 3) menus: HTML tabs → (없으면) 내부 API
+  // 3) menus
   if (!place.menus || place.menus.length === 0) {
-    const candidates = [`${base}/price`, `${base}/menu`, `${base}/booking`];
+    const priceUrl = `${base}/price`;
 
-    let priceHtmlHint = "";
-
-    for (const url of candidates) {
-      try {
-        const fetched = await fetchPlaceHtml(url, { minLength: 120, retries: 1, timeoutMs: 9000 });
-
-        if (/\/price($|\?)/i.test(fetched.finalUrl) || /\/price($|\?)/i.test(url)) {
-          priceHtmlHint = fetched.html;
+    // (A) HTML 파싱 먼저
+    let priceHtml = "";
+    try {
+      const fetched = await fetchPlaceHtml(priceUrl, { minLength: 120, retries: 1, timeoutMs: 9000 });
+      priceHtml = fetched.html;
+      const parsed = parsePlaceFromHtml(fetched.html, fetched.finalUrl);
+      if (parsed?.menus?.length) {
+        const cleaned = cleanMenus(parsed.menus);
+        if (cleaned.length) {
+          place.menus = cleaned;
+          place._menuDebug = { via: "html", priceLen: fetched.html.length };
+          return place;
         }
-
-        const parsed = parsePlaceFromHtml(fetched.html, fetched.finalUrl);
-        if (parsed?.menus && parsed.menus.length > 0) {
-          const cleaned = cleanMenus(parsed.menus);
-          if (cleaned.length > 0) {
-            place.menus = cleaned;
-            return place;
-          }
-        }
-      } catch {}
+      }
+    } catch (e: any) {
+      place._menuDebug = { via: "html", error: e?.message ?? "html failed" };
     }
 
-    // ✅ 내부 API 시도 + debug 저장
-    if (place.placeId && priceHtmlHint) {
-      const { menus, debug } = await tryFetchMenusInternal(place.placeId, priceHtmlHint);
-      place._menuDebug = debug;
+    // (B) ✅ Playwright 캡처(최종 100%)
+    try {
+      const { menus, debug } = await fetchMenusViaPlaywright(priceUrl);
+      place._menuDebug = { ...(place._menuDebug || {}), via: "playwright", ...debug, priceLen: priceHtml ? priceHtml.length : undefined };
 
-      if (menus.length > 0) {
-        place.menus = cleanMenus(menus as InternalMenu[]);
+      if (menus.length) {
+        place.menus = cleanMenus(menus);
         return place;
       }
+    } catch (e: any) {
+      place._menuDebug = { ...(place._menuDebug || {}), via: "playwright", error: e?.message ?? "pw failed" };
     }
   } else {
     place.menus = cleanMenus(place.menus);
