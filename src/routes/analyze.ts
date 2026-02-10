@@ -6,6 +6,7 @@ import { resolvePlace } from "../services/resolvePlace.js";
 import { fetchPlaceHtml } from "../services/fetchPlace.js";
 import { parsePlaceFromHtml } from "../services/parsePlace.js";
 import { normalizePlace } from "../services/normalize.js";
+import { enrichPlace } from "../services/enrichPlace.js";
 
 import { autoClassifyIndustry } from "../industry/autoClassify.js";
 import { scorePlace } from "../services/score.js";
@@ -27,25 +28,21 @@ router.post("/analyze", async (req, res) => {
   const requestId = `req_${Date.now().toString(36)}`;
 
   try {
-    // 1) 입력 URL 정규화(일단 place/home로 맞춤)
     const resolved = await resolvePlace(input as any, options as any);
 
-    // 2) HTML fetch (리다이렉트 최종 URL까지 받음)
     const fetched = await fetchPlaceHtml(resolved.placeUrl);
-
-    // 3) 파싱은 최종 URL 기준으로
     const rawPlace = parsePlaceFromHtml(fetched.html, fetched.finalUrl);
 
-    // 4) normalize
-    const place = normalizePlace({
+    let place = normalizePlace({
       ...rawPlace,
       placeUrl: fetched.finalUrl
     });
 
-    // 5) 업종 자동분류
+    // ✅ 추가 보강: /photo, /price(/menu)에서 더 채움 + directions 자동 생성
+    place = (await enrichPlace(place as any)) as any;
+
     const industry = autoClassifyIndustry(place);
 
-    // 6) 점수/추천
     const scores = scorePlace(place, industry.vertical);
     const recommendRaw = recommendForPlace(place, scores, industry.subcategory);
     const recommend = applyPlanToRecommend(options.plan, recommendRaw);
@@ -55,8 +52,8 @@ router.post("/analyze", async (req, res) => {
         requestId,
         mode: input.mode,
         plan: options.plan,
-        placeUrl: fetched.finalUrl,             // ✅ 최종 URL
-        resolvedFrom: resolved.placeUrl,        // ✅ 정규화된 원본(디버그용)
+        placeUrl: fetched.finalUrl,
+        resolvedFrom: resolved.placeUrl,
         resolvedConfidence: resolved.confidence ?? null,
         fetchedAt: new Date().toISOString()
       },
