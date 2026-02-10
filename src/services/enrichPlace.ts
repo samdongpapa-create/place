@@ -65,11 +65,19 @@ export async function enrichPlace(place: PlaceProfileLike): Promise<PlaceProfile
           }
         }
 
-        // fallback: "커트 30,000원" 등 텍스트 패턴
+        // ✅ fallback A: "커트 30,000원" 등 텍스트 패턴
         const guessed = guessMenusFromHtml(fetched.html);
         const cleaned2 = cleanMenus(guessed);
         if (cleaned2.length > 0) {
           place.menus = cleaned2;
+          break;
+        }
+
+        // ✅ fallback B (핵심): Next.js __NEXT_DATA__ JSON 안에서 메뉴/가격 추출
+        const guessed3 = guessMenusFromNextData(fetched.html);
+        const cleaned3 = cleanMenus(guessed3);
+        if (cleaned3.length > 0) {
+          place.menus = cleaned3;
           break;
         }
       } catch {
@@ -150,6 +158,104 @@ function guessMenusFromHtml(html: string): Menu[] {
   }
 
   return out;
+}
+
+/**
+ * ✅ Next.js __NEXT_DATA__ 안에 "메뉴/가격"이 들어있는데,
+ * HTML 텍스트에 "원"으로 안 박혀서 정규식이 실패하는 케이스 대응.
+ */
+function guessMenusFromNextData(html: string): Menu[] {
+  const out: Menu[] = [];
+  const seen = new Set<string>();
+
+  // __NEXT_DATA__ 추출
+  const m = html.match(/<script[^>]+id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/i);
+  if (!m?.[1]) return out;
+
+  let json: any;
+  try {
+    json = JSON.parse(m[1]);
+  } catch {
+    return out;
+  }
+
+  // 가격 키 후보 (네이버 내부 구조가 바뀌어도 최대한 버티도록 넓게)
+  const priceKeys = ["price", "salePrice", "amount", "value", "minPrice", "maxPrice"];
+  const nameKeys = ["name", "menuName", "title"];
+
+  const toNumber = (v: any): number | undefined => {
+    if (typeof v === "number" && Number.isFinite(v)) return v;
+    if (typeof v === "string") {
+      const s = v.replace(/,/g, "");
+      const n = Number(s);
+      if (Number.isFinite(n)) return n;
+    }
+    return undefined;
+  };
+
+  const isObj = (x: any) => x && typeof x === "object" && !Array.isArray(x);
+
+  const pickName = (obj: any): string | undefined => {
+    for (const k of nameKeys) {
+      if (typeof obj?.[k] === "string" && obj[k].trim()) return obj[k].trim();
+    }
+    return undefined;
+  };
+
+  const pickPrice = (obj: any): number | undefined => {
+    for (const k of priceKeys) {
+      const v = obj?.[k];
+      const n = toNumber(v);
+      if (typeof n === "number") return n;
+
+      // price가 { value: 24000 } 같은 구조일 수 있음
+      if (isObj(v)) {
+        for (const kk of priceKeys.concat(["won", "krw"])) {
+          const nn = toNumber(v?.[kk]);
+          if (typeof nn === "number") return nn;
+        }
+      }
+    }
+    return undefined;
+  };
+
+  const walk = (node: any) => {
+    if (!node) return;
+
+    if (Array.isArray(node)) {
+      for (const it of node) walk(it);
+      return;
+    }
+
+    if (isObj(node)) {
+      // 1) 메뉴로 보이는 오브젝트 패턴: name + price 조합
+      const name = pickName(node);
+      const price = pickPrice(node);
+
+      if (name && (typeof price === "number")) {
+        if (!looksLikeParkingFee(name)) {
+          const key = `${name}:${price}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            out.push({ name: name.replace(/\s+/g, " "), price });
+          }
+        }
+      }
+
+      // 2) durationMin 같이 힌트가 있을 수도 있으니 note로 담기
+      // (추후 필요하면 여기 확장)
+
+      // 3) 재귀
+      for (const k of Object.keys(node)) {
+        walk(node[k]);
+      }
+    }
+  };
+
+  walk(json);
+
+  // 너무 잡음이 많을 수 있으니, 미용실 대표 30개까지만
+  return out.slice(0, 30);
 }
 
 function looksLikeParkingFee(name: string) {
