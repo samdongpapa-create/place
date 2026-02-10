@@ -1,3 +1,4 @@
+// src/services/parsePlace.ts
 import * as cheerio from "cheerio";
 
 type MenuItem = { name: string; price?: number; durationMin?: number; note?: string };
@@ -29,10 +30,7 @@ export function parsePlaceFromHtml(html: string, placeUrl: string) {
     try { nextData = JSON.parse(nextDataText); } catch { nextData = null; }
   }
 
-  // script blob state
-  const placeIdHint = extractPlaceId(placeUrl);
-  const scriptStateObjects = extractStateObjectsFromScripts($, html, placeIdHint);
-
+  // ✅ dehydrated queries + candidates 구성
   const queryDatas: any[] = [];
   const candidates: any[] = [];
 
@@ -52,15 +50,13 @@ export function parsePlaceFromHtml(html: string, placeUrl: string) {
       }
     }
   }
-
-  for (const o of scriptStateObjects) candidates.push(o);
   for (const obj of ldObjects) candidates.push(obj);
 
-  const placeId =
-    placeIdHint
+  const placeId = extractPlaceId(placeUrl)
     ?? deepFindString(candidates, ["placeId", "businessId", "id"])
     ?? undefined;
 
+  // name
   const nameFromData = deepFindString(candidates, ["placeName", "bizName", "name", "title"]);
   const rawName = isUselessTitle(ogTitle) ? (nameFromData ?? "UNKNOWN") : (ogTitle ?? nameFromData ?? "UNKNOWN");
   const name = cleanupName(rawName);
@@ -75,17 +71,21 @@ export function parsePlaceFromHtml(html: string, placeUrl: string) {
     (ogDesc && !isUselessDesc(ogDesc) ? ogDesc : undefined);
 
   if (description && looksLikeReviewCountLine(description)) {
-    const alt = deepFindString(candidates, ["introduction", "about", "bizIntro", "placeIntro", "homeDescription"]) ?? undefined;
+    const alt =
+      deepFindString(candidates, ["introduction", "about", "bizIntro", "placeIntro", "homeDescription"]) ?? undefined;
     if (alt) description = alt;
   }
 
+  // ✅ 대표키워드(= 실제로 설정된 키워드) 먼저 추출
+  const keywords = extractRepresentativeKeywords($, queryDatas, candidates);
+
+  // 기존 tags는 그대로(시설/서비스/해시태그 등 넓게)
   const tags = extractTags(candidates);
 
-  // ✅ menus: 기존 키 기반 + 강제 스캔(키 몰라도)
+  // menus (너는 이제 메뉴/가격 빼기로 했으니, 유지해도 되고 없어도 됨)
   const menus =
     extractMenusFromQueries(queryDatas)
-      .concat(extractMenusEnhanced(candidates))
-      .concat(scanMenusByPattern(candidates)); // 🔥 NEW
+    .concat(extractMenusEnhanced(candidates));
 
   const dedupMenus = dedupMenu(menus);
 
@@ -93,6 +93,7 @@ export function parsePlaceFromHtml(html: string, placeUrl: string) {
     deepFindNumber(candidates, ["visitorReviewCount", "visitorReviews", "reviewCount", "userReviewCount"]) ?? undefined;
 
   const blogCount = deepFindNumber(candidates, ["blogReviewCount", "blogReviews"]) ?? undefined;
+
   const rating = deepFindNumber(candidates, ["rating", "averageRating", "starRating", "score"]) ?? undefined;
 
   const photoCountFromKeys =
@@ -114,160 +115,18 @@ export function parsePlaceFromHtml(html: string, placeUrl: string) {
     roadAddress,
     description,
     directions: undefined,
+    keywords: keywords.length ? keywords : undefined, // ✅ 추가
     tags: tags.length ? tags : undefined,
-    menus: dedupMenus.length ? dedupMenus : undefined,
-    reviews: { visitorCount, blogCount, rating },
-    photos: { count: photoCount }
+    // menus: dedupMenus.length ? dedupMenus : undefined, // ✅ 메뉴/가격 안 쓰면 여기 주석 처리해도 됨
+    reviews: {
+      visitorCount,
+      blogCount,
+      rating
+    },
+    photos: {
+      count: photoCount
+    }
   };
-}
-
-/**
- * 🔥 NEW: 키 이름 몰라도 “name/title + price 숫자” 패턴이 많은 배열을 찾아 menus로 변환
- * - /price 페이지에서 menu 구조가 특이할 때 이게 마지막 안전장치
- */
-function scanMenusByPattern(objs: any[]): MenuItem[] {
-  const out: MenuItem[] = [];
-  const arrays = collectArraysFromMany(objs);
-
-  // 후보 배열을 점수화해서 상위 몇 개만 변환
-  const scored: { arr: any[]; score: number }[] = [];
-
-  for (const arr of arrays) {
-    if (!Array.isArray(arr) || arr.length < 3) continue;
-
-    // 너무 큰 배열(수천)도 스킵(성능)
-    if (arr.length > 2000) continue;
-
-    // 샘플로 점수 계산
-    const sample = arr.slice(0, 30);
-    let hasName = 0;
-    let hasPrice = 0;
-
-    for (const it of sample) {
-      const n = asNonEmptyString(it?.name ?? it?.title ?? it?.menuName ?? it?.serviceName ?? it?.productName);
-      if (n) hasName++;
-
-      const p = asNumber(it?.price ?? it?.minPrice ?? it?.maxPrice ?? it?.amount ?? it?.value ?? it?.cost ?? it?.priceValue);
-      if (typeof p === "number" && p >= 5000 && p <= 2000000) hasPrice++;
-    }
-
-    // 최소 조건: 이름/가격이 어느 정도는 있어야 menu 후보
-    if (hasName < 3 || hasPrice < 2) continue;
-
-    // “비율” 점수
-    const score = hasName * 2 + hasPrice * 3;
-    scored.push({ arr, score });
-  }
-
-  scored.sort((a, b) => b.score - a.score);
-
-  for (const c of scored.slice(0, 6)) {
-    out.push(...menuFromAny(c.arr));
-    if (out.length >= 60) break;
-  }
-
-  return out;
-}
-
-function collectArraysFromMany(objs: any[]): any[][] {
-  const out: any[][] = [];
-  for (const o of objs) out.push(...collectArrays(o, 0));
-  return out;
-}
-
-/**
- * script에서 state blob 추출
- */
-function extractStateObjectsFromScripts($: cheerio.CheerioAPI, rawHtml: string, placeIdHint: string | null) {
-  const out: any[] = [];
-
-  const assignKeys = [
-    "__APOLLO_STATE__",
-    "__INITIAL_STATE__",
-    "__PLACE_STATE__",
-    "__PRELOADED_STATE__",
-    "__STATE__"
-  ];
-
-  const scripts: string[] = [];
-  $("script").each((_, el) => {
-    const t = $(el).text();
-    if (t && t.length > 200) scripts.push(t);
-  });
-  if (rawHtml && rawHtml.length > 2000) scripts.push(rawHtml);
-
-  for (const text of scripts) {
-    if (placeIdHint && text.length > 5000 && !text.includes(placeIdHint)) continue;
-
-    for (const k of assignKeys) {
-      const obj = extractAssignedJsonObject(text, k);
-      if (obj) out.push(obj);
-    }
-
-    if (/dehydratedstate|apollo|graphql|price|menu|product/i.test(text)) {
-      const obj2 = extractFirstLargeJsonObject(text);
-      if (obj2) out.push(obj2);
-    }
-  }
-
-  return out.slice(0, 10);
-}
-
-function extractAssignedJsonObject(text: string, key: string): any | null {
-  const re = new RegExp(`(?:window\\.)?${escapeRegExp(key)}\\s*=\\s*({)`, "m");
-  const m = re.exec(text);
-  if (!m || m.index == null) return null;
-
-  const start = text.indexOf("{", m.index);
-  if (start < 0) return null;
-
-  const jsonStr = sliceBalancedBraces(text, start, 2_000_000);
-  if (!jsonStr) return null;
-
-  try { return JSON.parse(jsonStr); } catch { return null; }
-}
-
-function extractFirstLargeJsonObject(text: string): any | null {
-  const start = text.indexOf("{");
-  if (start < 0) return null;
-  const jsonStr = sliceBalancedBraces(text, start, 1_200_000);
-  if (!jsonStr) return null;
-  try {
-    const obj = JSON.parse(jsonStr);
-    if (obj && typeof obj === "object") return obj;
-  } catch {}
-  return null;
-}
-
-function sliceBalancedBraces(text: string, start: number, maxLen: number): string | null {
-  let depth = 0;
-  let inStr = false;
-  let esc = false;
-
-  const endLimit = Math.min(text.length, start + maxLen);
-
-  for (let i = start; i < endLimit; i++) {
-    const ch = text[i];
-
-    if (inStr) {
-      if (esc) esc = false;
-      else if (ch === "\\") esc = true;
-      else if (ch === '"') inStr = false;
-      continue;
-    } else {
-      if (ch === '"') { inStr = true; continue; }
-      if (ch === "{") depth++;
-      if (ch === "}") {
-        depth--;
-        if (depth === 0) return text.slice(start, i + 1);
-      }
-    }
-  }
-  return null;
-}
-
-function escapeRegExp(s: string) {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function cleanupName(n: string) {
@@ -360,6 +219,87 @@ function asNumber(v: any): number | null {
   return null;
 }
 
+/**
+ * ✅ “대표키워드” 추출
+ * 우선순위:
+ * 1) queryDatas/candidates 안의 대표키워드 계열 키
+ * 2) DOM에서 키워드 칩(버튼/링크 텍스트) 훑기
+ */
+function extractRepresentativeKeywords($: cheerio.CheerioAPI, queryDatas: any[], candidates: any[]): string[] {
+  const out = new Set<string>();
+
+  // 1) 데이터 키 기반
+  const keywordKeys = [
+    "representativeKeywords",
+    "representativeKeyword",
+    "keywords",
+    "keywordList",
+    "placeKeywords",
+    "searchKeywords",
+    "bizKeywords",
+    "hashTags",
+    "themeTags"
+  ];
+
+  for (const k of keywordKeys) {
+    const v1 = deepFindByKey(queryDatas, k);
+    pushKeywords(out, v1);
+
+    const v2 = deepFindByKey(candidates, k);
+    pushKeywords(out, v2);
+  }
+
+  // 2) DOM 기반(키워드 칩/태그)
+  // 너무 공격적으로 잡지 않도록: 길이 제한 + 숫자/리뷰문구 제외
+  const chipTexts: string[] = [];
+  $("a,button,span,div").each((_, el) => {
+    const t = $(el).text()?.trim();
+    if (!t) return;
+    if (t.length < 2 || t.length > 18) return;
+    if (/방문자리뷰|블로그리뷰|예약|길찾기|공유|전화/i.test(t)) return;
+    if (/^\d+$/.test(t)) return;
+    if (!/[가-힣A-Za-z]/.test(t)) return;
+    chipTexts.push(t);
+  });
+
+  // “키워드”일 법한 것만: 너무 흔한 UI 문구 제거
+  const stop = new Set([
+    "홈","메뉴","사진","리뷰","예약","가격","지도","정보","더보기","펼치기","접기","저장"
+  ]);
+
+  for (const t of chipTexts) {
+    const x = t.replace(/^#/, "").trim();
+    if (stop.has(x)) continue;
+    if (x.length < 2) continue;
+    out.add(x);
+    if (out.size >= 20) break;
+  }
+
+  return Array.from(out).slice(0, 15);
+}
+
+function pushKeywords(out: Set<string>, v: any) {
+  if (!v) return;
+
+  if (Array.isArray(v)) {
+    for (const it of v) {
+      const s = asNonEmptyString(it?.name ?? it?.title ?? it?.keyword ?? it);
+      if (s) out.add(s.replace(/^#/, "").trim());
+    }
+    return;
+  }
+
+  if (typeof v === "object") {
+    const arr = v.items ?? v.list ?? v.keywords ?? v.tags ?? undefined;
+    if (Array.isArray(arr)) {
+      for (const it of arr) {
+        const s = asNonEmptyString(it?.name ?? it?.title ?? it?.keyword ?? it);
+        if (s) out.add(s.replace(/^#/, "").trim());
+      }
+    }
+  }
+}
+
 function extractTags(objs: any[]): string[] {
   const out = new Set<string>();
   const keys = ["tags", "keywords", "hashTags", "themeTags", "services", "serviceTags", "facilities"];
@@ -375,9 +315,11 @@ function extractTags(objs: any[]): string[] {
   return Array.from(out).slice(0, 15);
 }
 
+/**
+ * (아래 메뉴 관련 로직은 너가 “메뉴/가격 빼자”면 유지해도 되고 제거해도 됨)
+ */
 function extractMenusFromQueries(queryDatas: any[]): MenuItem[] {
   const out: MenuItem[] = [];
-
   const keys = [
     "priceList", "priceLists", "priceItems", "prices",
     "serviceItems", "services", "treatments", "treatmentItems",
@@ -387,7 +329,6 @@ function extractMenusFromQueries(queryDatas: any[]): MenuItem[] {
 
   for (const data of queryDatas) {
     if (!data) continue;
-
     for (const k of keys) {
       const v = deepFindByKey([data], k);
       if (Array.isArray(v)) out.push(...menuFromAny(v));
@@ -396,36 +337,7 @@ function extractMenusFromQueries(queryDatas: any[]): MenuItem[] {
         if (Array.isArray(maybeArr)) out.push(...menuFromAny(maybeArr));
       }
     }
-
-    const foundArrays = collectArrays(data, 0);
-    for (const arr of foundArrays) {
-      if (arr.length < 2) continue;
-      const sample = arr.slice(0, 3);
-      const ok =
-        sample.some((it: any) => asNonEmptyString(it?.name ?? it?.title ?? it?.menuName ?? it?.serviceName)) &&
-        sample.some((it: any) => asNumber(it?.price ?? it?.minPrice ?? it?.maxPrice ?? it?.amount ?? it?.value));
-      if (!ok) continue;
-      out.push(...menuFromAny(arr));
-    }
   }
-
-  return out;
-}
-
-function collectArrays(obj: any, depth: number): any[][] {
-  if (!obj || depth > 10) return [];
-  const out: any[][] = [];
-
-  if (Array.isArray(obj)) {
-    out.push(obj);
-    for (const it of obj) out.push(...collectArrays(it, depth + 1));
-    return out;
-  }
-
-  if (typeof obj === "object") {
-    for (const k of Object.keys(obj)) out.push(...collectArrays(obj[k], depth + 1));
-  }
-
   return out;
 }
 
@@ -452,7 +364,7 @@ function extractMenusEnhanced(objs: any[]): MenuItem[] {
 function menuFromAny(arr: any[]): MenuItem[] {
   const out: MenuItem[] = [];
   for (const it of arr) {
-    const name = asNonEmptyString(it?.name ?? it?.title ?? it?.menuName ?? it?.serviceName ?? it?.productName ?? it);
+    const name = asNonEmptyString(it?.name ?? it?.title ?? it?.menuName ?? it?.serviceName ?? it);
     if (!name) continue;
 
     const rawPrice = it?.price ?? it?.minPrice ?? it?.maxPrice ?? it?.amount ?? it?.value ?? it?.cost ?? it?.priceValue;
