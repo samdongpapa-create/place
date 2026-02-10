@@ -1,6 +1,7 @@
 // src/services/enrichPlace.ts
 import { fetchMenusViaPlaywright, type Menu } from "./playwrightMenus.js";
 import { fetchExistingKeywordsViaPlaywright } from "./playwrightKeywords.js";
+import { fetchRepresentativeKeywords5ByFrameSource } from "./playwrightKeywordList.js";
 
 type PlaceProfileLike = {
   placeId?: string;
@@ -12,7 +13,8 @@ type PlaceProfileLike = {
   description?: string;
   directions?: string;
   tags?: string[];
-  keywords?: string[]; // ✅ 기존 대표키워드
+  keywords?: string[]; // ✅ 기존 대표키워드(원문 전체)
+  keywords5?: string[]; // ✅ 기존 대표키워드 5개(유료 전환용)
   menus?: Menu[];
   reviews?: any;
   photos?: { count?: number };
@@ -24,23 +26,63 @@ export async function enrichPlace(place: PlaceProfileLike): Promise<PlaceProfile
   const base = basePlaceUrl(place.placeUrl);
   const isHair = isHairSalon(place);
 
-  // 0) ✅ 기존 대표키워드(중요)
+  // =========================
+  // 0) ✅ 기존 대표키워드(최우선)
+  //    1) "프레임 소스(keywordList)" 방식
+  //    2) 실패 시 기존 GraphQL/DOM 휴리스틱 폴백
+  // =========================
   if (!place.keywords || place.keywords.length === 0) {
+    const homeUrl = `${base}/home`;
+
+    // (A) frame source keywordList 파싱 (정답 루트)
     try {
-      const homeUrl = `${base}/home`;
-      const kw = await fetchExistingKeywordsViaPlaywright(homeUrl);
-      if (kw.keywords.length) place.keywords = kw.keywords.slice(0, 15);
-      place._keywordDebug = kw.debug;
+      const kw = await fetchRepresentativeKeywords5ByFrameSource(homeUrl);
+
+      if (kw.raw?.length) {
+        place.keywords = kw.raw.slice(0, 15);
+        place.keywords5 = kw.keywords5?.length ? kw.keywords5 : kw.raw.slice(0, 5);
+      }
+
+      place._keywordDebug = { via: "frame-keywordList", ...kw.debug };
     } catch (e: any) {
-      place._keywordDebug = { error: e?.message ?? "keyword pw failed" };
+      place._keywordDebug = { via: "frame-keywordList", error: e?.message ?? "keywordList parse failed" };
+    }
+
+    // (B) 그래도 없으면 폴백 (GraphQL/DOM)
+    if (!place.keywords || place.keywords.length === 0) {
+      try {
+        const kw2 = await fetchExistingKeywordsViaPlaywright(homeUrl);
+        if (kw2.keywords?.length) {
+          place.keywords = kw2.keywords.slice(0, 15);
+          place.keywords5 = kw2.keywords.slice(0, 5);
+        }
+        place._keywordDebug = {
+          ...(place._keywordDebug || {}),
+          fallback: { via: "graphql-dom-heuristic", ...kw2.debug }
+        };
+      } catch (e: any) {
+        place._keywordDebug = {
+          ...(place._keywordDebug || {}),
+          fallback: { via: "graphql-dom-heuristic", error: e?.message ?? "keyword pw failed" }
+        };
+      }
+    }
+  } else {
+    // keywords가 이미 있으면 5개도 맞춰줌
+    if (!place.keywords5 || place.keywords5.length === 0) {
+      place.keywords5 = place.keywords.slice(0, 5);
     }
   }
 
-  // 1) ✅ 메뉴/가격: 미용실은 price 탭 Playwright만 (안되면 배제)
+  // =========================
+  // 1) ✅ 메뉴/가격: 미용실은 /price Playwright만 (안되면 배제)
+  // =========================
   if (isHair && (!place.menus || place.menus.length === 0)) {
     const priceUrl = `${base}/price`;
+
     try {
       const pw = await fetchMenusViaPlaywright(priceUrl);
+
       if (pw.menus.length) {
         place.menus = cleanMenus(pw.menus);
         place._menuDebug = { via: "hair-price-pw", isHair, ...pw.debug };
@@ -52,7 +94,6 @@ export async function enrichPlace(place: PlaceProfileLike): Promise<PlaceProfile
     }
   }
 
-  // (선택) 일반 업종 메뉴까지 할 거면 여기에 /menu playwright or html 추가
   return place;
 }
 
@@ -110,3 +151,4 @@ function cleanMenus(menus: Menu[]): Menu[] {
 
   return out.slice(0, 30);
 }
+
