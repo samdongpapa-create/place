@@ -7,7 +7,7 @@ type PlaceProfileLike = {
   placeId?: string;
   placeUrl: string;
   name?: string;
-  category?: string;
+  category?: string; // "미용실" 등
   address?: string;
   roadAddress?: string;
   description?: string;
@@ -22,18 +22,77 @@ type PlaceProfileLike = {
 export async function enrichPlace(place: PlaceProfileLike): Promise<PlaceProfileLike> {
   const base = basePlaceUrl(place.placeUrl);
 
-  // ✅ directions 복구: 비어있으면 자동 생성
+  // ✅ directions 자동 생성 유지
   if (!place.directions || place.directions.trim().length < 3) {
     const auto = autoDirections(place);
     if (auto) place.directions = auto;
   }
 
-  // ✅ menus: 정적(price/menu/home) → booking html → playwright(booking → price)
-  if (!place.menus || place.menus.length === 0) {
-    const debug: any = { chain: [] as any[] };
+  // ✅ 업종 판단: 미용실은 price가 “정답”
+  const isHair = isHairSalon(place);
 
-    // (A) 정적/HTML 파싱: /price → /menu → /home
-    for (const url of [`${base}/price`, `${base}/menu`, `${base}/home`]) {
+  if (!place.menus || place.menus.length === 0) {
+    const debug: any = { isHair, chain: [] as any[] };
+
+    // -------------------------
+    // 1) 미용실: /price 집중 공략
+    // -------------------------
+    if (isHair) {
+      const priceUrl = `${base}/price`;
+
+      // (A) /price HTML 파싱
+      try {
+        const fetched = await fetchPlaceHtml(priceUrl, { minLength: 120 });
+        const parsed = parsePlaceFromHtml(fetched.html, fetched.finalUrl);
+        const cleaned = parsed?.menus ? cleanMenus(parsed.menus) : [];
+        debug.chain.push({ step: "hair-price-html", url: priceUrl, len: fetched.html.length, menus: cleaned.length });
+
+        if (cleaned.length) {
+          place.menus = cleaned;
+          place._menuDebug = { via: "hair-price-html", ...debug };
+          return place;
+        }
+      } catch (e: any) {
+        debug.chain.push({ step: "hair-price-html", url: priceUrl, error: e?.message ?? "price html failed" });
+      }
+
+      // (B) /price Playwright(GraphQL) 파싱
+      try {
+        const pw = await fetchMenusViaPlaywright(priceUrl);
+        debug.chain.push({ step: "hair-price-pw", url: priceUrl, ...pw.debug, menus: pw.menus.length });
+
+        if (pw.menus.length) {
+          place.menus = cleanMenus(pw.menus);
+          place._menuDebug = { via: "hair-price-pw", ...debug };
+          return place;
+        }
+      } catch (e: any) {
+        debug.chain.push({ step: "hair-price-pw", url: priceUrl, error: e?.message ?? "price pw failed" });
+      }
+
+      // (C) 마지막 폴백: /booking Playwright (일부 매장은 상품이 booking에만 있음)
+      const bookingUrl = `${base}/booking`;
+      try {
+        const pw = await fetchMenusViaPlaywright(bookingUrl);
+        debug.chain.push({ step: "hair-booking-pw", url: bookingUrl, ...pw.debug, menus: pw.menus.length });
+
+        if (pw.menus.length) {
+          place.menus = cleanMenus(pw.menus);
+          place._menuDebug = { via: "hair-booking-pw", ...debug };
+          return place;
+        }
+      } catch (e: any) {
+        debug.chain.push({ step: "hair-booking-pw", url: bookingUrl, error: e?.message ?? "booking pw failed" });
+      }
+
+      place._menuDebug = { via: "hair-none", ...debug };
+      return place;
+    }
+
+    // -------------------------
+    // 2) 일반 업종: menu/home 중심
+    // -------------------------
+    for (const url of [`${base}/menu`, `${base}/home`, `${base}/price`]) {
       try {
         const fetched = await fetchPlaceHtml(url, { minLength: 120 });
         const parsed = parsePlaceFromHtml(fetched.html, fetched.finalUrl);
@@ -51,54 +110,33 @@ export async function enrichPlace(place: PlaceProfileLike): Promise<PlaceProfile
       }
     }
 
-    // (B) booking html 파싱
+    // 최후: booking/playwright
     const bookingUrl = `${base}/booking`;
     try {
-      const fetched = await fetchPlaceHtml(bookingUrl, { minLength: 120 });
-      const parsed = parsePlaceFromHtml(fetched.html, fetched.finalUrl);
-      const cleaned = parsed?.menus ? cleanMenus(parsed.menus) : [];
+      const pw = await fetchMenusViaPlaywright(bookingUrl);
+      debug.chain.push({ step: "pw", url: bookingUrl, ...pw.debug, menus: pw.menus.length });
 
-      debug.chain.push({ step: "booking-html", url: bookingUrl, len: fetched.html.length, menus: cleaned.length });
-
-      if (cleaned.length) {
-        place.menus = cleaned;
-        place._menuDebug = { via: "booking-html", ...debug };
+      if (pw.menus.length) {
+        place.menus = cleanMenus(pw.menus);
+        place._menuDebug = { via: "pw", ...debug };
         return place;
       }
     } catch (e: any) {
-      debug.chain.push({ step: "booking-html", url: bookingUrl, error: e?.message ?? "booking html failed" });
+      debug.chain.push({ step: "pw", url: bookingUrl, error: e?.message ?? "pw failed" });
     }
 
-    // (C) playwright: booking 우선 → price 폴백
-    try {
-      const pw1 = await fetchMenusViaPlaywright(bookingUrl);
-      debug.chain.push({ step: "playwright", url: bookingUrl, ...pw1.debug, menus: pw1.menus.length });
-
-      if (pw1.menus.length) {
-        place.menus = cleanMenus(pw1.menus);
-        place._menuDebug = { via: "playwright-booking", ...debug };
-        return place;
-      }
-
-      const priceUrl = `${base}/price`;
-      const pw2 = await fetchMenusViaPlaywright(priceUrl);
-      debug.chain.push({ step: "playwright", url: priceUrl, ...pw2.debug, menus: pw2.menus.length });
-
-      if (pw2.menus.length) {
-        place.menus = cleanMenus(pw2.menus);
-        place._menuDebug = { via: "playwright-price", ...debug };
-        return place;
-      }
-
-      place._menuDebug = { via: "playwright-none", ...debug };
-    } catch (e: any) {
-      place._menuDebug = { via: "playwright-error", ...debug, error: e?.message ?? "pw failed" };
-    }
+    place._menuDebug = { via: "none", ...debug };
   } else {
     place.menus = cleanMenus(place.menus);
   }
 
   return place;
+}
+
+function isHairSalon(place: PlaceProfileLike) {
+  const c = (place.category || "").toLowerCase();
+  const n = (place.name || "").toLowerCase();
+  return c.includes("미용실") || n.includes("헤어") || n.includes("hair");
 }
 
 function basePlaceUrl(url: string) {
@@ -150,7 +188,6 @@ function cleanMenus(menus: Menu[]): Menu[] {
     if (!/[가-힣A-Za-z]/.test(name)) continue;
     if (looksLikeParkingFee(name)) continue;
 
-    // 가격이 있으면만 sanity check
     if (typeof price === "number") {
       if (price < 5000) continue;
       if (price > 2000000) continue;
