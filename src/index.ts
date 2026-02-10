@@ -1,13 +1,9 @@
 import express from "express";
 import helmet from "helmet";
-import { analyzeRouter } from "./routes/analyze.js"; // ✅ named import
+import { analyzeRouter } from "./routes/analyze.js";
 
 const app = express();
 
-/**
- * ✅ 테스트 화면에서 인라인 스크립트가 막히는 문제(CSP) 방지
- * - 운영 전환 때는 다시 CSP 설정을 제대로 잡으면 됨
- */
 app.use(
   helmet({
     contentSecurityPolicy: false,
@@ -15,7 +11,6 @@ app.use(
   })
 );
 
-// ✅ 테스트 중 캐시로 인해 결과가 안 바뀐 것처럼 보이는 상황 방지
 app.use((_req, res, next) => {
   res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
   res.setHeader("Pragma", "no-cache");
@@ -111,6 +106,4 @@ app.get("/health", (_req, res) => res.json({ ok: true }));
 app.use("/api", analyzeRouter);
 
 const port = Number(process.env.PORT || 3000);
-app.listen(port, () => {
-  console.log(`✅ place-audit running on :${port}`);
-});
+app.listen(port, () => console.log(`✅ place-audit running on :${port}`));
