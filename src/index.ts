@@ -8,7 +8,7 @@ app.use(helmet());
 app.use(express.json({ limit: "1mb" }));
 
 /**
- * 🧪 테스트용 웹 화면
+ * 🧪 테스트용 웹 화면 (디버그 최적화 버전)
  */
 app.get("/", (_req, res) => {
   res.type("html").send(`
@@ -24,17 +24,16 @@ app.get("/", (_req, res) => {
       padding: 40px;
     }
     .wrap {
-      max-width: 720px;
+      max-width: 760px;
       margin: auto;
       background: #fff;
       padding: 24px;
       border-radius: 12px;
       box-shadow: 0 10px 30px rgba(0,0,0,.08);
     }
-    h1 {
-      margin-bottom: 16px;
-    }
-    input, select, button, textarea {
+    h1 { margin-bottom: 16px; }
+    label { font-weight: 600; }
+    input, select, button {
       width: 100%;
       margin-top: 8px;
       padding: 10px;
@@ -42,15 +41,13 @@ app.get("/", (_req, res) => {
     }
     button {
       background: #2563eb;
-      color: white;
+      color: #fff;
       border: none;
       border-radius: 8px;
       cursor: pointer;
       margin-top: 16px;
     }
-    button:hover {
-      background: #1e40af;
-    }
+    button:hover { background: #1e40af; }
     pre {
       margin-top: 20px;
       background: #0f172a;
@@ -59,10 +56,12 @@ app.get("/", (_req, res) => {
       border-radius: 8px;
       overflow-x: auto;
       font-size: 12px;
+      min-height: 120px;
     }
     .hint {
       font-size: 12px;
       color: #666;
+      margin-top: 8px;
     }
   </style>
 </head>
@@ -71,7 +70,10 @@ app.get("/", (_req, res) => {
     <h1>🧪 네이버 플레이스 진단 테스트</h1>
 
     <label>네이버 플레이스 URL</label>
-    <input id="placeUrl" placeholder="https://m.place.naver.com/place/1234567890/home" />
+    <input
+      id="placeUrl"
+      placeholder="https://m.place.naver.com/place/1234567890/home"
+    />
 
     <label>요금제</label>
     <select id="plan">
@@ -82,8 +84,8 @@ app.get("/", (_req, res) => {
     <button onclick="analyze()">Analyze</button>
 
     <p class="hint">
-      • FREE: 키워드 3개 + 요약<br/>
-      • PRO: 복붙용 상세설명 / 찾아오는길 포함
+      • FREE: 점수 + 대표 키워드 3개<br/>
+      • PRO: 복붙용 상세설명 / 찾아오는 길 포함
     </p>
 
     <pre id="result">결과가 여기에 표시됩니다.</pre>
@@ -109,18 +111,20 @@ async function analyze() {
       body: JSON.stringify({
         input: {
           mode: "place_url",
-          placeUrl
+          placeUrl: placeUrl
         },
         options: {
-          plan
+          plan: plan
         }
       })
     });
 
-    const data = await res.json();
-    resultEl.textContent = JSON.stringify(data, null, 2);
+    // 🔥 JSON 파싱 안 함 — 서버가 뭘 주든 그대로 출력
+    const text = await res.text();
+    resultEl.textContent = text;
+
   } catch (e) {
-    resultEl.textContent = "에러 발생: " + e.message;
+    resultEl.textContent = "❌ 요청 실패: " + e.message;
   }
 }
 </script>
@@ -129,7 +133,9 @@ async function analyze() {
   `);
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true }));
+app.get("/health", (_req, res) => {
+  res.json({ ok: true });
+});
 
 app.use("/api", analyzeRouter);
 
