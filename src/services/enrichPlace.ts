@@ -2,7 +2,7 @@
 import { fetchMenusViaPlaywright, type Menu } from "./playwrightMenus.js";
 import { fetchExistingKeywordsViaPlaywright } from "./playwrightKeywords.js";
 import { fetchRepresentativeKeywords5ByFrameSource } from "./playwrightKeywordList.js";
-import { scorePlace } from "./scorePlace.js";
+import { scorePlace } from "./scorePlace.js"; // ✅ 상단 import
 
 type PlaceProfileLike = {
   placeId?: string;
@@ -14,58 +14,57 @@ type PlaceProfileLike = {
   description?: string;
   directions?: string;
   tags?: string[];
-  keywords?: string[];
-  keywords5?: string[];
+  keywords?: string[];   // 기존 대표키워드(원문 전체)
+  keywords5?: string[];  // 기존 대표키워드 5개(유료 전환용)
   menus?: Menu[];
   reviews?: any;
   photos?: { count?: number };
   _menuDebug?: any;
   _keywordDebug?: any;
-
-  // 혹시 이전 파이프라인에서 내려오면 제거 대상
+  // ✅ 점수 결과 붙일 거면 여기에 필드 추가 가능(타입 엄격히 할수록 좋음)
   scores?: any;
-  recommend?: any;
-  todoTop5?: any;
   keyword?: any;
 };
 
-export async function enrichPlace(place: PlaceProfileLike): Promise<any> {
+export async function enrichPlace(place: PlaceProfileLike): Promise<PlaceProfileLike> {
   const base = basePlaceUrl(place.placeUrl);
   const isHair = isHairSalon(place);
 
-  // ✅ 이전 단계에서 scores/recommend가 이미 들어왔어도 여기서 싹 제거 (중복 방지)
-  delete (place as any).scores;
-  delete (place as any).recommend;
-  delete (place as any).todoTop5;
-  delete (place as any).keyword;
-
   // =========================
-  // 0) 대표키워드(최우선)
+  // 0) ✅ 대표키워드 + 주소(프레임 소스 루트)
   // =========================
   if (!place.keywords || place.keywords.length === 0) {
     const homeUrl = `${base}/home`;
 
+    // (A) frame source keywordList (정답 루트)
     try {
       const kw = await fetchRepresentativeKeywords5ByFrameSource(homeUrl);
-      if (kw?.raw?.length) {
+
+      if (kw.raw?.length) {
         place.keywords = kw.raw.slice(0, 15);
-        place.keywords5 = (kw.keywords5?.length ? kw.keywords5 : kw.raw.slice(0, 5)).slice(0, 5);
+        place.keywords5 = kw.keywords5?.length ? kw.keywords5 : kw.raw.slice(0, 5);
       }
-      place._keywordDebug = { via: "frame-keywordList", ...(kw?.debug ?? {}) };
+
+      // ✅ 주소도 같이 채움(비어있을 때만)
+      if (!place.roadAddress && kw.roadAddress) place.roadAddress = kw.roadAddress;
+      if (!place.address && kw.address) place.address = kw.address;
+
+      place._keywordDebug = { via: "frame-keywordList", ...kw.debug };
     } catch (e: any) {
       place._keywordDebug = { via: "frame-keywordList", error: e?.message ?? "keywordList parse failed" };
     }
 
+    // (B) 그래도 없으면 폴백 (GraphQL/DOM)
     if (!place.keywords || place.keywords.length === 0) {
       try {
         const kw2 = await fetchExistingKeywordsViaPlaywright(homeUrl);
-        if (kw2?.keywords?.length) {
+        if (kw2.keywords?.length) {
           place.keywords = kw2.keywords.slice(0, 15);
           place.keywords5 = kw2.keywords.slice(0, 5);
         }
         place._keywordDebug = {
           ...(place._keywordDebug || {}),
-          fallback: { via: "graphql-dom-heuristic", ...(kw2?.debug ?? {}) }
+          fallback: { via: "graphql-dom-heuristic", ...kw2.debug }
         };
       } catch (e: any) {
         place._keywordDebug = {
@@ -81,18 +80,19 @@ export async function enrichPlace(place: PlaceProfileLike): Promise<any> {
   }
 
   // =========================
-  // 1) 메뉴/가격: 미용실은 /price Playwright만
+  // 1) ✅ 메뉴/가격: 미용실은 /price Playwright만 (안되면 배제)
   // =========================
   if (isHair && (!place.menus || place.menus.length === 0)) {
     const priceUrl = `${base}/price`;
 
     try {
       const pw = await fetchMenusViaPlaywright(priceUrl);
-      if (pw?.menus?.length) {
+
+      if (pw.menus.length) {
         place.menus = cleanMenus(pw.menus);
-        place._menuDebug = { via: "hair-price-pw", isHair, ...(pw?.debug ?? {}) };
+        place._menuDebug = { via: "hair-price-pw", isHair, ...pw.debug };
       } else {
-        place._menuDebug = { via: "hair-none", isHair, ...(pw?.debug ?? {}) };
+        place._menuDebug = { via: "hair-none", isHair, ...pw.debug };
       }
     } catch (e: any) {
       place._menuDebug = { via: "hair-price-pw", isHair, error: e?.message ?? "price pw failed" };
@@ -100,20 +100,16 @@ export async function enrichPlace(place: PlaceProfileLike): Promise<any> {
   }
 
   // =========================
-  // 2) 점수화는 scorePlace 1번만
+  // 2) ✅ 점수 산출(리포트 1회용 핵심)
   // =========================
   const audit = scorePlace(place);
-
-  return {
-    ...place,
-    ...audit
-  };
+  return { ...place, ...audit };
 }
 
 function isHairSalon(place: PlaceProfileLike) {
   const c = (place.category || "").toLowerCase();
   const n = (place.name || "").toLowerCase();
-  return c.includes("미용실") || n.includes("헤어") || n.includes("hair") || c.includes("헤어");
+  return c.includes("미용실") || n.includes("헤어") || n.includes("hair");
 }
 
 function basePlaceUrl(url: string) {
