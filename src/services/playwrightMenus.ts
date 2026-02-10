@@ -10,100 +10,20 @@ function asString(v: any): string | null {
   }
   return null;
 }
-function asNumber(v: any): number | null {
-  if (typeof v === "number" && Number.isFinite(v)) return v;
-  if (typeof v === "string") {
-    const cleaned = v.replace(/[^\d.]/g, "");
-    if (!cleaned) return null;
-    const n = Number(cleaned);
-    return Number.isFinite(n) ? n : null;
-  }
-  return null;
+
+function parsePriceToNumber(text: string): number | null {
+  // 12,000원 / 12000 / 12 000 / ₩12,000 등을 숫자로 변환
+  const cleaned = text.replace(/[^\d]/g, "");
+  if (!cleaned) return null;
+  const n = Number(cleaned);
+  if (!Number.isFinite(n)) return null;
+  return n;
 }
 
 function looksHairService(name: string) {
   return /(커트|컷|펌|염색|클리닉|두피|뿌리|매직|볼륨|드라이|셋팅|탈색|톤다운|컬러|다운펌|열펌|디자인펌|헤드스파)/i.test(
     name
   );
-}
-function looksLikeStaffName(name: string) {
-  return /(디자이너|원장|실장|팀장|디렉터|매니저|아티스트)/i.test(name);
-}
-function looksLikeProfileNote(note: string) {
-  return /(Diploma|수상|경력|선정|아카데미|교육강사|ambassador|Specialist|Colorlist|Expert)/i.test(note);
-}
-
-function hasNumberDeep(obj: any, depth = 0): boolean {
-  if (!obj || depth > 6) return false;
-  if (typeof obj === "number" && Number.isFinite(obj)) return true;
-  if (typeof obj === "string") return /\d/.test(obj);
-  if (Array.isArray(obj)) return obj.some((x) => hasNumberDeep(x, depth + 1));
-  if (typeof obj === "object") return Object.values(obj).some((x) => hasNumberDeep(x, depth + 1));
-  return false;
-}
-
-function collectArrays(obj: any, depth = 0): any[][] {
-  if (!obj || depth > 10) return [];
-  const out: any[][] = [];
-  if (Array.isArray(obj)) {
-    out.push(obj);
-    for (const it of obj) out.push(...collectArrays(it, depth + 1));
-    return out;
-  }
-  if (typeof obj === "object") {
-    for (const k of Object.keys(obj)) out.push(...collectArrays(obj[k], depth + 1));
-  }
-  return out;
-}
-
-function normalizeFromItem(it: any): Menu | null {
-  const name =
-    asString(
-      it?.name ??
-        it?.title ??
-        it?.menuName ??
-        it?.serviceName ??
-        it?.productName ??
-        it?.itemName ??
-        it?.displayName ??
-        it
-    ) ?? null;
-
-  if (!name) return null;
-
-  const note = asString(it?.note ?? it?.desc ?? it?.description ?? it?.memo) ?? undefined;
-
-  // ✅ 디자이너/프로필 제거
-  if (looksLikeStaffName(name)) return null;
-  if (note && looksLikeProfileNote(note)) return null;
-
-  const rawPrice =
-    it?.price ??
-    it?.minPrice ??
-    it?.maxPrice ??
-    it?.amount ??
-    it?.value ??
-    it?.cost ??
-    it?.priceValue ??
-    it?.salePrice ??
-    it?.discountPrice ??
-    it?.originPrice ??
-    it?.priceInfo?.price ??
-    it?.priceInfo?.amount ??
-    it?.price?.value;
-
-  const price = asNumber(rawPrice) ?? undefined;
-  const durationMin = asNumber(it?.durationMin ?? it?.duration ?? it?.time ?? it?.leadTime) ?? undefined;
-
-  // ✅ 서비스 키워드도 없고 price/time도 없으면 버림(오탐 방지)
-  if (!looksHairService(name) && typeof price !== "number" && typeof durationMin !== "number") return null;
-
-  return {
-    name,
-    ...(typeof price === "number" ? { price } : {}),
-    ...(durationMin ? { durationMin } : {}),
-    ...(note ? { note } : {})
-  };
 }
 
 function dedup(menus: Menu[]) {
@@ -115,85 +35,52 @@ function dedup(menus: Menu[]) {
     seen.add(key);
     out.push(m);
   }
-  return out.slice(0, 40);
+  return out.slice(0, 30);
 }
 
-function extractMenusHeuristic(json: any): Menu[] {
-  const candidates: Menu[] = [];
-  const arrays = collectArrays(json, 0);
+function cleanMenus(menus: Menu[]): Menu[] {
+  const out: Menu[] = [];
+  const seen = new Set<string>();
 
-  for (const arr of arrays) {
-    if (!Array.isArray(arr) || arr.length < 2) continue;
+  for (const it of menus || []) {
+    const name = (it?.name || "").trim();
+    const price = typeof it?.price === "number" ? it.price : undefined;
 
-    const sample = arr.slice(0, 6);
-    const hasName = sample.some((it) =>
-      asString(it?.name ?? it?.title ?? it?.menuName ?? it?.serviceName ?? it?.productName ?? it?.itemName)
-    );
-    if (!hasName) continue;
+    if (!name) continue;
+    if (!/[가-힣A-Za-z]/.test(name)) continue;
 
-    const hasAnyNumber = sample.some((it) => hasNumberDeep(it));
-    const hasHairKeyword = sample.some((it) => {
-      const nm = asString(it?.name ?? it?.title ?? it?.menuName ?? it?.serviceName ?? it?.productName ?? it?.itemName);
-      return nm ? looksHairService(nm) : false;
-    });
+    // 너무 짧거나 이상한 문구 컷
+    if (name.length < 2) continue;
 
-    if (!hasAnyNumber && !hasHairKeyword) continue;
-
-    for (const it of arr) {
-      const m = normalizeFromItem(it);
-      if (m) candidates.push(m);
+    // 가격이 있으면 현실 범위로 컷(오탐 방지)
+    if (typeof price === "number") {
+      if (price < 5000) continue;
+      if (price > 2000000) continue;
     }
+
+    const key = `${name}:${price ?? "na"}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    out.push({
+      name,
+      ...(typeof price === "number" ? { price } : {}),
+      ...(typeof it.durationMin === "number" ? { durationMin: it.durationMin } : {}),
+      ...(it.note ? { note: it.note } : {})
+    });
   }
 
-  const hair = candidates.filter((m) => looksHairService(m.name));
-  if (hair.length) return dedup(hair);
-  return dedup(candidates);
+  // 헤어 키워드 있는 항목 우선
+  const hair = out.filter((m) => looksHairService(m.name));
+  return dedup(hair.length ? hair : out);
 }
 
-function keysPreview(x: any): string[] {
-  if (Array.isArray(x)) {
-    const first = x[0];
-    if (first && typeof first === "object" && !Array.isArray(first)) return Object.keys(first).slice(0, 30);
-    return ["__array__"];
-  }
-  if (x && typeof x === "object") return Object.keys(x).slice(0, 30);
-  return [`__${typeof x}__`];
-}
+// ✅ 가격탭에서 강제 스크롤/탭 클릭으로 DOM을 최대한 렌더링
+async function triggerPriceDomRender(page: any) {
+  // 기본 대기 (초기 렌더)
+  await page.waitForTimeout(700);
 
-function safeJsonParse(s: string): any | null {
-  try {
-    return JSON.parse(s);
-  } catch {
-    return null;
-  }
-}
-
-// ✅ 배치 응답([ {data...}, {data...} ])에서도 data 유무 판단
-function batchHasData(parsed: any): boolean {
-  if (Array.isArray(parsed)) return parsed.some((x) => x && typeof x === "object" && !!x.data);
-  if (parsed && typeof parsed === "object") return !!parsed.data;
-  return false;
-}
-
-// ✅ 배치 응답이면 각 요소도 같이 훑어서 메뉴를 찾음
-function extractMenusFromParsed(parsed: any): Menu[] {
-  const all: Menu[] = [];
-  if (Array.isArray(parsed)) {
-    for (const el of parsed) all.push(...extractMenusHeuristic(el));
-    // 전체 배열 자체에서도 훑기(중첩 구조 케이스)
-    all.push(...extractMenusHeuristic(parsed));
-  } else {
-    all.push(...extractMenusHeuristic(parsed));
-  }
-  return dedup(all);
-}
-
-// ✅ 가격탭에서 “가격표 요청”을 유발하는 강제 트리거
-async function triggerPriceRequests(page: any) {
-  // 0) 기본 대기
-  await page.waitForTimeout(1500);
-
-  // 1) 혹시 모달/팝업 닫기(있으면)
+  // 모달/팝업 닫기(있으면)
   const closeSelectors = [
     'button[aria-label*="닫기"]',
     'button:has-text("닫기")',
@@ -203,203 +90,195 @@ async function triggerPriceRequests(page: any) {
   ];
   for (const sel of closeSelectors) {
     try {
-      await page
-        .locator(sel)
-        .first()
-        .click({ timeout: 800 })
-        .catch(() => {});
+      await page.locator(sel).first().click({ timeout: 500 }).catch(() => {});
     } catch {}
   }
 
-  // 2) “가격표/시술/커트/펌/염색” 같은 칩/탭/버튼을 싹 클릭(존재하는 것만)
+  // "가격표" 관련 텍스트가 있으면 눌러보기(없으면 스킵)
   const clickWords = ["가격표", "가격", "시술", "커트", "펌", "염색", "클리닉", "두피", "드라이", "매직", "탈색", "컬러"];
   for (const w of clickWords) {
     try {
       const loc = page.getByText(new RegExp(w)).first();
       const cnt = await loc.count().catch(() => 0);
       if (cnt > 0) {
-        await loc.click({ timeout: 900 }).catch(() => {});
-        await page.waitForTimeout(500);
+        await loc.click({ timeout: 600 }).catch(() => {});
+        await page.waitForTimeout(250);
       }
     } catch {}
   }
 
-  // 3) 아코디언(aria-expanded=false) 같은 요소를 강제로 여러 개 열기
-  try {
-    const accord = page.locator('[aria-expanded="false"]');
-    const n = Math.min(await accord.count().catch(() => 0), 12);
-    for (let i = 0; i < n; i++) {
-      await accord.nth(i).click({ timeout: 900 }).catch(() => {});
-      await page.waitForTimeout(450);
-    }
-  } catch {}
-
-  // 4) role=button / button을 무작정 몇 개 눌러서 로딩 트리거 (너무 과하면 위험하니 10개 제한)
-  try {
-    const btns = page.locator("button, [role=\"button\"]");
-    const n = Math.min(await btns.count().catch(() => 0), 10);
-    for (let i = 0; i < n; i++) {
-      // 예약/공유 같은 버튼 오동작 방지: 텍스트가 너무 긴 건 스킵
-      const t = (await btns.nth(i).innerText().catch(() => "")) || "";
-      if (t.length > 40) continue;
-
-      await btns.nth(i).click({ timeout: 800 }).catch(() => {});
-      await page.waitForTimeout(300);
-    }
-  } catch {}
-
-  // 5) 스크롤: 윈도우 + 내부 컨테이너 둘 다 시도
+  // 스크롤 여러 번(렌더/지연 로딩 유도)
   try {
     for (let i = 0; i < 6; i++) {
-      await page.mouse.wheel(0, 2200);
-      await page.waitForTimeout(650);
+      await page.mouse.wheel(0, 1800);
+      await page.waitForTimeout(350);
     }
   } catch {}
 
-  // ✅ 내부 스크롤 컨테이너(있으면)도 강제로 내리기
-  // (Node TS 환경에서 DOM 전역(document/window/HTMLElement)을 직접 참조하면 빌드가 깨져서 globalThis + any로 처리)
+  // 내부 스크롤 컨테이너도 내려보기 (DOM 타입 참조 없이 globalThis + any)
   try {
     await page.evaluate(() => {
       const doc: any = (globalThis as any).document;
       const win: any = (globalThis as any).window;
       if (!doc || !win) return;
 
-      const els = Array.from(doc.querySelectorAll("*")) as any[];
+      const all = Array.from(doc.querySelectorAll("*")) as any[];
 
-      const scrollables = els.filter((el: any) => {
+      const scrollables = all.filter((el: any) => {
         const style = win.getComputedStyle?.(el);
         const oy = style?.overflowY;
         return (oy === "auto" || oy === "scroll") && el.scrollHeight > el.clientHeight + 200;
       });
 
-      scrollables.slice(0, 3).forEach((el: any) => {
+      scrollables.slice(0, 2).forEach((el: any) => {
         el.scrollTop = el.scrollHeight;
       });
     });
-
-    await page.waitForTimeout(900);
+    await page.waitForTimeout(400);
   } catch {}
 
-  // 6) 추가 대기 (graphql 늦게 오기도 함)
-  await page.waitForTimeout(1500);
+  // 마지막 대기(지연 렌더)
+  await page.waitForTimeout(600);
+}
+
+// ✅ DOM에서 "메뉴명 + 가격"을 최대한 빠르게 뽑는 전용 추출기
+async function extractMenusFromDom(page: any): Promise<Menu[]> {
+  const rows = await page.evaluate(() => {
+    const doc: any = (globalThis as any).document;
+    const win: any = (globalThis as any).window;
+    if (!doc || !win) return [];
+
+    const textOf = (el: any) => (el?.innerText || el?.textContent || "").trim();
+
+    const priceRegex = /(?:₩\s*)?\d{1,3}(?:[,\s]\d{3})+\s*원?|\d+\s*원/g;
+
+    // 가격이 포함된 "텍스트 덩어리" 찾기
+    const nodes = Array.from(doc.querySelectorAll("body *")) as any[];
+    const hits: any[] = [];
+
+    for (const el of nodes) {
+      const t = textOf(el);
+      if (!t) continue;
+      if (t.length > 120) continue; // 너무 긴 블록은 오탐 많음
+      if (!priceRegex.test(t)) continue;
+
+      // 가격표가 보통 버튼/링크에도 섞이니 아주 짧은 것만 제외
+      if (t.length < 3) continue;
+
+      hits.push({ t, el });
+    }
+
+    const out: { name: string; priceText: string }[] = [];
+
+    const pickNameFromContainer = (el: any) => {
+      // 같은 컨테이너 안에서 "가격이 아닌 텍스트"를 이름 후보로 잡음
+      const container = el?.closest?.("li, article, section, div") || el?.parentElement;
+      const base = container || el;
+      const cand = textOf(base);
+
+      // 한 덩어리에서 가격을 제거한 나머지를 이름으로 쓰기
+      const name = cand.replace(priceRegex, "").replace(/\s+/g, " ").trim();
+
+      // 너무 길면 줄 단위 첫 문장으로 줄이기
+      if (name.length > 40) return name.split("\n")[0].slice(0, 40).trim();
+      return name;
+    };
+
+    for (const h of hits.slice(0, 200)) {
+      const t = h.t as string;
+
+      // 가장 먼저 매칭되는 가격 텍스트 1개만
+      const m = t.match(priceRegex);
+      const priceText = (m && m[0]) ? m[0].trim() : "";
+      if (!priceText) continue;
+
+      const name = pickNameFromContainer(h.el);
+      if (!name) continue;
+
+      // 너무 일반적인 UI/라벨 제외
+      if (/^(문의|예약|공유|지도|길찾기|전화|영업시간|소식)$/i.test(name)) continue;
+
+      out.push({ name, priceText });
+    }
+
+    return out;
+  });
+
+  const menus: Menu[] = [];
+  for (const r of rows as any[]) {
+    const name = asString(r?.name) ?? null;
+    if (!name) continue;
+
+    const priceNum = typeof r?.priceText === "string" ? parsePriceToNumber(r.priceText) : null;
+
+    // 헤어 서비스 키워드도 없고 가격도 없으면 제외
+    if (!looksHairService(name) && typeof priceNum !== "number") continue;
+
+    menus.push({
+      name,
+      ...(typeof priceNum === "number" ? { price: priceNum } : {})
+    });
+  }
+
+  return cleanMenus(menus);
 }
 
 export async function fetchMenusViaPlaywright(targetUrl: string) {
   const debug = {
     used: true,
     targetUrl,
-    capturedUrls: [] as string[],
-    capturedOps: [] as { url: string; operationName?: string; variablesKeys?: string[]; rawPostDataHead?: string }[],
-    jsonResponses: 0,
-    menusFound: 0,
-    capturedGraphqlSamples: [] as {
-      url: string;
-      contentType?: string;
-      topKeys: string[];
-      hasDataKey: boolean;
-      arraysFound: number;
-      rawResponseHead?: string;
-    }[]
+    strategy: "price-dom-fast",
+    elapsedMs: 0,
+    menusFound: 0
   };
+
+  const started = Date.now();
 
   const browser = await chromium.launch({
     headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"]
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-blink-features=AutomationControlled"
+    ]
   });
 
   try {
     const context = await browser.newContext({
       userAgent:
         "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-      locale: "ko-KR"
+      locale: "ko-KR",
+      viewport: { width: 390, height: 844 }
     });
 
-    const page = await context.newPage();
-    const menus: Menu[] = [];
-
-    page.on("request", (req) => {
-      const url = req.url();
-      if (!/graphql/i.test(url)) return;
-
-      debug.capturedUrls.push(url);
-      if (debug.capturedUrls.length > 120) return;
-
-      if (req.method() === "POST") {
-        const post = req.postData() || "";
-        const head = post.slice(0, 280);
-
-        let op: string | undefined;
-        let varsKeys: string[] | undefined;
-
-        const parsed = safeJsonParse(post);
-        if (parsed) {
-          if (Array.isArray(parsed)) {
-            const p0 = parsed[0];
-            op = p0?.operationName;
-            varsKeys = p0?.variables && typeof p0.variables === "object" ? Object.keys(p0.variables) : [];
-          } else {
-            op = parsed?.operationName;
-            varsKeys = parsed?.variables && typeof parsed.variables === "object" ? Object.keys(parsed.variables) : [];
-          }
-        }
-
-        debug.capturedOps.push({
-          url,
-          operationName: op,
-          variablesKeys: varsKeys ?? [],
-          rawPostDataHead: head
-        });
-      }
-    });
-
-    page.on("response", async (res) => {
-      const url = res.url();
-      if (!/graphql/i.test(url)) return;
-
-      const ct = (res.headers()["content-type"] || "").toLowerCase();
-
+    // webdriver 감추기(가볍게)
+    await context.addInitScript(() => {
       try {
-        // ✅ 무조건 text로 받고 JSON을 우리가 파싱
-        const text = await res.text();
-        const head = text.slice(0, 320);
-        const parsed = safeJsonParse(text);
-
-        debug.jsonResponses++;
-
-        const topKeys = keysPreview(parsed ?? text);
-        const hasDataKey = batchHasData(parsed);
-        const arraysFound = parsed ? collectArrays(parsed, 0).length : 0;
-
-        debug.capturedGraphqlSamples.push({
-          url,
-          contentType: ct,
-          topKeys,
-          hasDataKey,
-          arraysFound,
-          rawResponseHead: head
-        });
-
-        if (parsed) {
-          const found = extractMenusFromParsed(parsed);
-          if (found.length) menus.push(...found);
-        }
+        Object.defineProperty((globalThis as any).navigator, "webdriver", { get: () => false });
       } catch {}
     });
 
-    // ✅ 여기 중요: networkidle로 바로 끝내지 말고, domcontentloaded 후 액션으로 호출 유도
-    await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+    const page = await context.newPage();
 
-    // ✅ 가격탭은 클릭/스크롤로 요청이 터지는 케이스가 많음
-    await triggerPriceRequests(page);
+    // ✅ 빠르게 실패하도록 타임아웃을 줄임
+    page.setDefaultTimeout(8000);
 
-    // ✅ 추가 대기(뒤늦게 호출되는 graphql 잡기)
-    await page.waitForTimeout(1500);
+    await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
 
-    const out = dedup(menus);
-    debug.menusFound = out.length;
+    // ✅ 강제 렌더 유도
+    await triggerPriceDomRender(page);
 
-    return { menus: out.slice(0, 30), debug };
+    // ✅ DOM 기반 메뉴 추출
+    const menus = await extractMenusFromDom(page);
+
+    debug.menusFound = menus.length;
+    debug.elapsedMs = Date.now() - started;
+
+    return { menus, debug };
+  } catch (e: any) {
+    debug.elapsedMs = Date.now() - started;
+    return { menus: [] as Menu[], debug: { ...debug, error: e?.message ?? "pw failed" } };
   } finally {
-    await browser.close();
+    await browser.close().catch(() => {});
   }
 }
