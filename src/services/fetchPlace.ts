@@ -1,8 +1,13 @@
 // src/services/fetchPlace.ts
 export type FetchedPage = { html: string; finalUrl: string };
 
-export async function fetchPlaceHtml(placeUrl: string): Promise<FetchedPage> {
+type FetchOptions = {
+  minLength?: number; // 기본 2000
+};
+
+export async function fetchPlaceHtml(placeUrl: string, opts: FetchOptions = {}): Promise<FetchedPage> {
   if (!placeUrl) throw new Error("placeUrl is empty");
+  const minLength = typeof opts.minLength === "number" ? opts.minLength : 2000;
 
   const headers: Record<string, string> = {
     "User-Agent":
@@ -21,8 +26,10 @@ export async function fetchPlaceHtml(placeUrl: string): Promise<FetchedPage> {
   if (!res.ok) {
     throw new Error(`fetchPlaceHtml failed: ${res.status} ${res.statusText}\n${html.slice(0, 400)}`);
   }
-  if (html.length < 2000) {
-    throw new Error(`fetchPlaceHtml got too-small html (${html.length}). Possibly blocked.\nfinalUrl=${finalUrl}`);
+
+  // ✅ /photo, /price 같은 탭은 HTML이 짧을 수 있어서 옵션으로 완화
+  if (html.length < minLength) {
+    throw new Error(`fetchPlaceHtml got too-small html (${html.length}). minLength=${minLength}\nfinalUrl=${finalUrl}`);
   }
 
   return { html, finalUrl };
