@@ -1,4 +1,4 @@
-import { IndustryProfile } from "./profile";
+import type { IndustryProfile } from "./profile.js";
 
 export const REAL_ESTATE_OFFICE: IndustryProfile = {
   subcategory: "real_estate_office",
@@ -18,23 +18,29 @@ export const REAL_ESTATE_OFFICE: IndustryProfile = {
     "아파트", "상가", "사무실"
   ],
 
-  descriptionTemplate: ({ name, region, services, trust, cta }) => `
+  descriptionTemplate: (ctx) => {
+    const { name, region, services, trust, cta } = ctx;
+    const s = services.length ? services : ["전세/월세", "매매", "상가/사무실"];
+    const t = trust.length ? trust : ["조건(예산/입주일/우선순위) 먼저 정리", "허위·미끼 매물 지양", "계약 전 체크포인트 안내"];
+
+    return `
 ${region} 지역 위주로 전월세 및 매매 상담을 진행하는 ${name}입니다.
 
 상담 방식
-- 조건(예산/입주일/우선순위)을 먼저 정리
-- 허위·미끼 매물 없이 실제 매물만 안내
+- 조건(예산/입주일/우선순위)을 먼저 정리하고 매물을 좁혀드립니다.
+- 허위·미끼 매물 없이 실제 매물 중심으로 안내합니다.
 
 주요 중개 유형
-- ${services.join("\n- ")}
+- ${s.join("\n- ")}
 
 신뢰 포인트
-- ${trust.join("\n- ")}
+- ${t.join("\n- ")}
 
 ${cta}
-`.trim(),
+`.trim();
+  },
 
-  directionsTemplate: (region) => `
+  directionsTemplate: (region: string) => `
 ${region} 기준으로 안내드립니다.
 
 - ○○역 ○번 출구 인근
@@ -42,12 +48,7 @@ ${region} 기준으로 안내드립니다.
 - 방문 전 전화 예약 시 상담 대기 없음
 `.trim(),
 
-  photoChecklist: [
-    "사무실 외관",
-    "상담 공간",
-    "중개 등록증",
-    "내부 전경"
-  ],
-
-  bannedPhrases: ["확정 수익", "무조건 가능"]
+  photoChecklist: ["사무실 외관", "상담 공간", "중개 등록증", "내부 전경"],
+  bannedPhrases: ["확정 수익", "무조건 가능", "100% 계약"]
 };
+
