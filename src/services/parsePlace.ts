@@ -1,4 +1,3 @@
-// src/services/parsePlace.ts
 import * as cheerio from "cheerio";
 
 type MenuItem = { name: string; price?: number; durationMin?: number; note?: string };
@@ -30,14 +29,13 @@ export function parsePlaceFromHtml(html: string, placeUrl: string) {
     try { nextData = JSON.parse(nextDataText); } catch { nextData = null; }
   }
 
-  // ✅ NEW: script blob에서 state JSON을 “통째로” 캐치
-  const scriptStateObjects = extractStateObjectsFromScripts($, html, extractPlaceId(placeUrl));
+  // script blob state
+  const placeIdHint = extractPlaceId(placeUrl);
+  const scriptStateObjects = extractStateObjectsFromScripts($, html, placeIdHint);
 
-  // ✅ dehydrated queries를 “풀 스캔”해서 place 핵심 데이터 블록을 찾음
   const queryDatas: any[] = [];
   const candidates: any[] = [];
 
-  // 우선순위: nextData → scriptState → ld
   if (nextData) {
     candidates.push(nextData);
     const pp = nextData?.props?.pageProps;
@@ -55,18 +53,14 @@ export function parsePlaceFromHtml(html: string, placeUrl: string) {
     }
   }
 
-  for (const o of scriptStateObjects) {
-    candidates.push(o);
-  }
-
+  for (const o of scriptStateObjects) candidates.push(o);
   for (const obj of ldObjects) candidates.push(obj);
 
   const placeId =
-    extractPlaceId(placeUrl)
+    placeIdHint
     ?? deepFindString(candidates, ["placeId", "businessId", "id"])
     ?? undefined;
 
-  // name
   const nameFromData = deepFindString(candidates, ["placeName", "bizName", "name", "title"]);
   const rawName = isUselessTitle(ogTitle) ? (nameFromData ?? "UNKNOWN") : (ogTitle ?? nameFromData ?? "UNKNOWN");
   const name = cleanupName(rawName);
@@ -81,17 +75,17 @@ export function parsePlaceFromHtml(html: string, placeUrl: string) {
     (ogDesc && !isUselessDesc(ogDesc) ? ogDesc : undefined);
 
   if (description && looksLikeReviewCountLine(description)) {
-    const alt =
-      deepFindString(candidates, ["introduction", "about", "bizIntro", "placeIntro", "homeDescription"]) ?? undefined;
+    const alt = deepFindString(candidates, ["introduction", "about", "bizIntro", "placeIntro", "homeDescription"]) ?? undefined;
     if (alt) description = alt;
   }
 
   const tags = extractTags(candidates);
 
-  // ✅ menus: queryDatas 우선 + candidates
+  // ✅ menus: 기존 키 기반 + 강제 스캔(키 몰라도)
   const menus =
     extractMenusFromQueries(queryDatas)
-      .concat(extractMenusEnhanced(candidates));
+      .concat(extractMenusEnhanced(candidates))
+      .concat(scanMenusByPattern(candidates)); // 🔥 NEW
 
   const dedupMenus = dedupMenu(menus);
 
@@ -99,7 +93,6 @@ export function parsePlaceFromHtml(html: string, placeUrl: string) {
     deepFindNumber(candidates, ["visitorReviewCount", "visitorReviews", "reviewCount", "userReviewCount"]) ?? undefined;
 
   const blogCount = deepFindNumber(candidates, ["blogReviewCount", "blogReviews"]) ?? undefined;
-
   const rating = deepFindNumber(candidates, ["rating", "averageRating", "starRating", "score"]) ?? undefined;
 
   const photoCountFromKeys =
@@ -123,25 +116,71 @@ export function parsePlaceFromHtml(html: string, placeUrl: string) {
     directions: undefined,
     tags: tags.length ? tags : undefined,
     menus: dedupMenus.length ? dedupMenus : undefined,
-    reviews: {
-      visitorCount,
-      blogCount,
-      rating
-    },
-    photos: {
-      count: photoCount
-    }
+    reviews: { visitorCount, blogCount, rating },
+    photos: { count: photoCount }
   };
 }
 
 /**
- * ✅ NEW: 모든 script 텍스트에서 "state blob"을 찾아 JSON으로 뽑아 candidates에 넣는다.
- * - __NEXT_DATA__가 없을 때도 데이터가 window.__APOLLO_STATE__/__INITIAL_STATE__ 등에 들어가는 케이스 대응
+ * 🔥 NEW: 키 이름 몰라도 “name/title + price 숫자” 패턴이 많은 배열을 찾아 menus로 변환
+ * - /price 페이지에서 menu 구조가 특이할 때 이게 마지막 안전장치
+ */
+function scanMenusByPattern(objs: any[]): MenuItem[] {
+  const out: MenuItem[] = [];
+  const arrays = collectArraysFromMany(objs);
+
+  // 후보 배열을 점수화해서 상위 몇 개만 변환
+  const scored: { arr: any[]; score: number }[] = [];
+
+  for (const arr of arrays) {
+    if (!Array.isArray(arr) || arr.length < 3) continue;
+
+    // 너무 큰 배열(수천)도 스킵(성능)
+    if (arr.length > 2000) continue;
+
+    // 샘플로 점수 계산
+    const sample = arr.slice(0, 30);
+    let hasName = 0;
+    let hasPrice = 0;
+
+    for (const it of sample) {
+      const n = asNonEmptyString(it?.name ?? it?.title ?? it?.menuName ?? it?.serviceName ?? it?.productName);
+      if (n) hasName++;
+
+      const p = asNumber(it?.price ?? it?.minPrice ?? it?.maxPrice ?? it?.amount ?? it?.value ?? it?.cost ?? it?.priceValue);
+      if (typeof p === "number" && p >= 5000 && p <= 2000000) hasPrice++;
+    }
+
+    // 최소 조건: 이름/가격이 어느 정도는 있어야 menu 후보
+    if (hasName < 3 || hasPrice < 2) continue;
+
+    // “비율” 점수
+    const score = hasName * 2 + hasPrice * 3;
+    scored.push({ arr, score });
+  }
+
+  scored.sort((a, b) => b.score - a.score);
+
+  for (const c of scored.slice(0, 6)) {
+    out.push(...menuFromAny(c.arr));
+    if (out.length >= 60) break;
+  }
+
+  return out;
+}
+
+function collectArraysFromMany(objs: any[]): any[][] {
+  const out: any[][] = [];
+  for (const o of objs) out.push(...collectArrays(o, 0));
+  return out;
+}
+
+/**
+ * script에서 state blob 추출
  */
 function extractStateObjectsFromScripts($: cheerio.CheerioAPI, rawHtml: string, placeIdHint: string | null) {
   const out: any[] = [];
 
-  // 1) window.__SOMETHING__ = {...} 형태
   const assignKeys = [
     "__APOLLO_STATE__",
     "__INITIAL_STATE__",
@@ -155,35 +194,26 @@ function extractStateObjectsFromScripts($: cheerio.CheerioAPI, rawHtml: string, 
     const t = $(el).text();
     if (t && t.length > 200) scripts.push(t);
   });
-
-  // HTML 자체에도 있을 수 있어 큰 덩어리로도 훑어줌(안전장치)
   if (rawHtml && rawHtml.length > 2000) scripts.push(rawHtml);
 
   for (const text of scripts) {
-    // 너무 큰 건 비용이 크니 우선 placeId 힌트가 있으면 그걸 포함하는 덩어리만 우선
-    if (placeIdHint && text.length > 5000 && !text.includes(placeIdHint)) {
-      // 힌트가 없으면 스킵 (성능)
-      continue;
-    }
+    if (placeIdHint && text.length > 5000 && !text.includes(placeIdHint)) continue;
 
     for (const k of assignKeys) {
       const obj = extractAssignedJsonObject(text, k);
       if (obj) out.push(obj);
     }
 
-    // 2) "dehydratedState"나 "apollo" 같은 키워드가 있으면, json object를 강제로 추출 시도
-    if (/dehydratedstate|apollo|graphql|price|menu/i.test(text)) {
+    if (/dehydratedstate|apollo|graphql|price|menu|product/i.test(text)) {
       const obj2 = extractFirstLargeJsonObject(text);
       if (obj2) out.push(obj2);
     }
   }
 
-  // 중복 제거(완벽하진 않아도 됨)
-  return out.slice(0, 8);
+  return out.slice(0, 10);
 }
 
 function extractAssignedJsonObject(text: string, key: string): any | null {
-  // window.__APOLLO_STATE__ = {...};
   const re = new RegExp(`(?:window\\.)?${escapeRegExp(key)}\\s*=\\s*({)`, "m");
   const m = re.exec(text);
   if (!m || m.index == null) return null;
@@ -194,11 +224,7 @@ function extractAssignedJsonObject(text: string, key: string): any | null {
   const jsonStr = sliceBalancedBraces(text, start, 2_000_000);
   if (!jsonStr) return null;
 
-  try {
-    return JSON.parse(jsonStr);
-  } catch {
-    return null;
-  }
+  try { return JSON.parse(jsonStr); } catch { return null; }
 }
 
 function extractFirstLargeJsonObject(text: string): any | null {
@@ -208,7 +234,6 @@ function extractFirstLargeJsonObject(text: string): any | null {
   if (!jsonStr) return null;
   try {
     const obj = JSON.parse(jsonStr);
-    // 너무 작은 건 의미 없을 확률 높음
     if (obj && typeof obj === "object") return obj;
   } catch {}
   return null;
@@ -225,25 +250,16 @@ function sliceBalancedBraces(text: string, start: number, maxLen: number): strin
     const ch = text[i];
 
     if (inStr) {
-      if (esc) {
-        esc = false;
-      } else if (ch === "\\") {
-        esc = true;
-      } else if (ch === '"') {
-        inStr = false;
-      }
+      if (esc) esc = false;
+      else if (ch === "\\") esc = true;
+      else if (ch === '"') inStr = false;
       continue;
     } else {
-      if (ch === '"') {
-        inStr = true;
-        continue;
-      }
+      if (ch === '"') { inStr = true; continue; }
       if (ch === "{") depth++;
       if (ch === "}") {
         depth--;
-        if (depth === 0) {
-          return text.slice(start, i + 1);
-        }
+        if (depth === 0) return text.slice(start, i + 1);
       }
     }
   }
@@ -384,13 +400,11 @@ function extractMenusFromQueries(queryDatas: any[]): MenuItem[] {
     const foundArrays = collectArrays(data, 0);
     for (const arr of foundArrays) {
       if (arr.length < 2) continue;
-
       const sample = arr.slice(0, 3);
       const ok =
         sample.some((it: any) => asNonEmptyString(it?.name ?? it?.title ?? it?.menuName ?? it?.serviceName)) &&
         sample.some((it: any) => asNumber(it?.price ?? it?.minPrice ?? it?.maxPrice ?? it?.amount ?? it?.value));
       if (!ok) continue;
-
       out.push(...menuFromAny(arr));
     }
   }
@@ -438,7 +452,7 @@ function extractMenusEnhanced(objs: any[]): MenuItem[] {
 function menuFromAny(arr: any[]): MenuItem[] {
   const out: MenuItem[] = [];
   for (const it of arr) {
-    const name = asNonEmptyString(it?.name ?? it?.title ?? it?.menuName ?? it?.serviceName ?? it);
+    const name = asNonEmptyString(it?.name ?? it?.title ?? it?.menuName ?? it?.serviceName ?? it?.productName ?? it);
     if (!name) continue;
 
     const rawPrice = it?.price ?? it?.minPrice ?? it?.maxPrice ?? it?.amount ?? it?.value ?? it?.cost ?? it?.priceValue;
@@ -464,7 +478,6 @@ function dedupMenu(menus: MenuItem[]): MenuItem[] {
     const name = (m?.name || "").trim();
     if (!name) continue;
     if (!/[가-힣A-Za-z]/.test(name)) continue;
-
     if (typeof m.price === "number" && m.price < 5000) continue;
 
     const key = `${name}:${m.price ?? "na"}`;
