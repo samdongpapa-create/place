@@ -1,6 +1,6 @@
 import express from "express";
 import helmet from "helmet";
-import analyzeRouter from "./routes/analyze.js";
+import analyzeRouter from "./routes/analyze"; // ✅ .js 제거 (TS 빌드 안전)
 
 const app = express();
 
@@ -10,7 +10,7 @@ const app = express();
  */
 app.use(
   helmet({
-    contentSecurityPolicy: false, // 🔥 핵심
+    contentSecurityPolicy: false,
     crossOriginEmbedderPolicy: false
   })
 );
@@ -25,9 +25,6 @@ app.use((_req, res, next) => {
 
 app.use(express.json({ limit: "1mb" }));
 
-/**
- * 🧪 테스트용 웹 화면 (버튼 이벤트를 JS로 연결)
- */
 app.get("/", (_req, res) => {
   res.type("html").send(`
 <!DOCTYPE html>
@@ -96,7 +93,6 @@ app.get("/", (_req, res) => {
         })
       });
 
-      // ✅ 서버가 뭘 주든 그대로 보여줌(에러도 그대로 출력)
       const text = await res.text();
       resultEl.textContent = text || "(빈 응답)";
     } catch (e) {
