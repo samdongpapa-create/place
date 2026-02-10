@@ -15,6 +15,14 @@ app.use(
   })
 );
 
+// ✅ 테스트 중 캐시로 인해 결과가 안 바뀐 것처럼 보이는 상황 방지
+app.use((_req, res, next) => {
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+  next();
+});
+
 app.use(express.json({ limit: "1mb" }));
 
 /**
