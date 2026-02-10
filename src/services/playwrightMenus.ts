@@ -24,8 +24,6 @@ function asNumber(v: any): number | null {
 function looksHairService(name: string) {
   return /(커트|컷|펌|염색|클리닉|두피|뿌리|매직|볼륨|드라이|셋팅|탈색|톤다운|컬러|다운펌|열펌|디자인펌|헤드스파)/i.test(name);
 }
-
-// ✅ 디자이너/스태프 프로필 감지
 function looksLikeStaffName(name: string) {
   return /(디자이너|원장|실장|팀장|디렉터|매니저|아티스트)/i.test(name);
 }
@@ -73,7 +71,7 @@ function normalizeFromItem(it: any): Menu | null {
 
   const note = asString(it?.note ?? it?.desc ?? it?.description ?? it?.memo) ?? undefined;
 
-  // ✅ 스태프/프로필이면 메뉴에서 제외
+  // ✅ 디자이너/프로필 제거
   if (looksLikeStaffName(name)) return null;
   if (note && looksLikeProfileNote(note)) return null;
 
@@ -95,7 +93,7 @@ function normalizeFromItem(it: any): Menu | null {
   const price = asNumber(rawPrice) ?? undefined;
   const durationMin = asNumber(it?.durationMin ?? it?.duration ?? it?.time ?? it?.leadTime) ?? undefined;
 
-  // ✅ 미용 서비스 단어가 전혀 없고, 가격/시간도 없으면 후보에서 제외(오탐 방지)
+  // ✅ 서비스 키워드도 없고 price/time도 없으면 버림(오탐 방지)
   if (!looksHairService(name) && typeof price !== "number" && typeof durationMin !== "number") return null;
 
   return { name, ...(typeof price === "number" ? { price } : {}), ...(durationMin ? { durationMin } : {}), ...(note ? { note } : {}) };
@@ -113,11 +111,6 @@ function dedup(menus: Menu[]) {
   return out.slice(0, 40);
 }
 
-/**
- * ✅ 키에 의존하지 않고 “메뉴 배열”을 찾되,
- * - staff/profiles 오탐을 강하게 제거
- * - hair keyword 있는 name 우선
- */
 function extractMenusHeuristic(json: any): Menu[] {
   const candidates: Menu[] = [];
   const arrays = collectArrays(json, 0);
@@ -126,14 +119,10 @@ function extractMenusHeuristic(json: any): Menu[] {
     if (!Array.isArray(arr) || arr.length < 2) continue;
 
     const sample = arr.slice(0, 6);
-
-    // name-like 필드가 있는지
     const hasName = sample.some((it) => asString(it?.name ?? it?.title ?? it?.menuName ?? it?.serviceName ?? it?.productName ?? it?.itemName));
     if (!hasName) continue;
 
-    // 숫자(가격/시간 등)가 어딘가에 존재하는지
     const hasAnyNumber = sample.some((it) => hasNumberDeep(it));
-    // booking 쪽은 가격이 없을 수도 있어서, 숫자가 없으면 hair 키워드로 대신 통과
     const hasHairKeyword = sample.some((it) => {
       const nm = asString(it?.name ?? it?.title ?? it?.menuName ?? it?.serviceName ?? it?.productName ?? it?.itemName);
       return nm ? looksHairService(nm) : false;
@@ -149,13 +138,25 @@ function extractMenusHeuristic(json: any): Menu[] {
 
   const hair = candidates.filter((m) => looksHairService(m.name));
   if (hair.length) return dedup(hair);
-
   return dedup(candidates);
 }
 
-function topKeys(obj: any): string[] {
-  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return [];
-  return Object.keys(obj).slice(0, 30);
+function keysPreview(x: any): string[] {
+  if (Array.isArray(x)) {
+    const first = x[0];
+    if (first && typeof first === "object" && !Array.isArray(first)) return Object.keys(first).slice(0, 30);
+    return ["__array__"];
+  }
+  if (x && typeof x === "object") return Object.keys(x).slice(0, 30);
+  return [`__${typeof x}__`];
+}
+
+function safeJsonParse(s: string): any | null {
+  try {
+    return JSON.parse(s);
+  } catch {
+    return null;
+  }
 }
 
 export async function fetchMenusViaPlaywright(targetUrl: string) {
@@ -163,10 +164,17 @@ export async function fetchMenusViaPlaywright(targetUrl: string) {
     used: true,
     targetUrl,
     capturedUrls: [] as string[],
-    capturedOps: [] as { url: string; operationName?: string; variablesKeys?: string[] }[],
+    capturedOps: [] as { url: string; operationName?: string; variablesKeys?: string[]; rawPostDataHead?: string }[],
     jsonResponses: 0,
     menusFound: 0,
-    capturedGraphqlSamples: [] as { url: string; topKeys: string[]; hasDataKey: boolean; arraysFound: number }[]
+    capturedGraphqlSamples: [] as {
+      url: string;
+      contentType?: string;
+      topKeys: string[];
+      hasDataKey: boolean;
+      arraysFound: number;
+      rawResponseHead?: string;
+    }[]
   };
 
   const browser = await chromium.launch({
@@ -186,51 +194,81 @@ export async function fetchMenusViaPlaywright(targetUrl: string) {
 
     page.on("request", (req) => {
       const url = req.url();
-      if (!/graphql|api|booking|reserve|price|menu/i.test(url)) return;
+      if (!/graphql/i.test(url)) return;
 
       debug.capturedUrls.push(url);
       if (debug.capturedUrls.length > 80) return;
 
-      if (/graphql/i.test(url) && req.method() === "POST") {
-        const post = req.postData();
-        if (post) {
-          try {
-            const parsed = JSON.parse(post);
-            const op = parsed?.operationName;
-            const vars = parsed?.variables && typeof parsed.variables === "object" ? Object.keys(parsed.variables) : [];
-            debug.capturedOps.push({ url, operationName: op, variablesKeys: vars });
-          } catch {}
+      if (req.method() === "POST") {
+        const post = req.postData() || "";
+        const head = post.slice(0, 280);
+
+        // ✅ postData가 배열(batched graphql)일 수도 있어서 케이스 분기
+        let op: string | undefined;
+        let varsKeys: string[] | undefined;
+
+        const parsed = safeJsonParse(post);
+        if (parsed) {
+          if (Array.isArray(parsed)) {
+            const p0 = parsed[0];
+            op = p0?.operationName;
+            varsKeys = p0?.variables && typeof p0.variables === "object" ? Object.keys(p0.variables) : [];
+          } else {
+            op = parsed?.operationName;
+            varsKeys = parsed?.variables && typeof parsed.variables === "object" ? Object.keys(parsed.variables) : [];
+          }
         }
+
+        debug.capturedOps.push({
+          url,
+          operationName: op,
+          variablesKeys: varsKeys ?? [],
+          rawPostDataHead: head
+        });
       }
     });
 
     page.on("response", async (res) => {
-      try {
-        const url = res.url();
-        const ct = (res.headers()["content-type"] || "").toLowerCase();
-        const isGraphql = /graphql/i.test(url);
-        const isJson = ct.includes("application/json") || ct.includes("application/graphql-response+json");
-        if (!isGraphql || !isJson) return;
+      const url = res.url();
+      if (!/graphql/i.test(url)) return;
 
-        const data = await res.json().catch(() => null);
-        if (!data) return;
+      const ct = (res.headers()["content-type"] || "").toLowerCase();
+
+      try {
+        // ✅ 무조건 text로 먼저 받고, JSON 파싱은 우리가 한다 (네 지금 증상 해결 핵심)
+        const text = await res.text();
+        const head = text.slice(0, 320);
+
+        const parsed = safeJsonParse(text);
 
         debug.jsonResponses++;
 
+        const topKeys = keysPreview(parsed ?? text);
+        const hasDataKey = !!(parsed && typeof parsed === "object" && !Array.isArray(parsed) && (parsed as any).data);
+        const arraysFound = parsed ? collectArrays(parsed, 0).length : 0;
+
         debug.capturedGraphqlSamples.push({
           url,
-          topKeys: topKeys(data),
-          hasDataKey: !!data?.data,
-          arraysFound: collectArrays(data, 0).length
+          contentType: ct,
+          topKeys,
+          hasDataKey,
+          arraysFound,
+          rawResponseHead: head
         });
 
-        const found = extractMenusHeuristic(data);
-        if (found.length) menus.push(...found);
-      } catch {}
+        // ✅ 파싱 성공했을 때만 메뉴 탐색
+        if (parsed) {
+          const found = extractMenusHeuristic(parsed);
+          if (found.length) menus.push(...found);
+        }
+      } catch {
+        // ignore
+      }
     });
 
     await page.goto(targetUrl, { waitUntil: "networkidle", timeout: 25000 });
 
+    // booking은 스크롤로 추가 호출 유도
     try {
       await page.mouse.wheel(0, 1400);
       await page.waitForTimeout(1200);
