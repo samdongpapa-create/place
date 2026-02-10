@@ -6,6 +6,8 @@ import { parsePlaceFromHtml } from "../services/parsePlace.js";
 import { normalizePlace } from "../services/normalize.js";
 import { scorePlace } from "../services/score.js";
 import { recommendForPlace } from "../services/recommend.js";
+import { autoClassifyIndustry } from "../industry/autoClassify.js";
+import { applyPlanToRecommend } from "../services/applyPlan.js";
 
 const router = Router();
 
@@ -17,37 +19,43 @@ router.post("/analyze", async (req, res) => {
 
   const input = parsed.data.input;
   const options = parsed.data.options;
-
   const requestId = `req_${Date.now().toString(36)}`;
 
   try {
-    // 1) placeId / canonical url 확보
-    const resolved = await resolvePlace(input, options);
+    // 1) URL 확정
+    const resolved = await resolvePlace(input as any, options as any);
 
-    // 2) place_url 모드면 HTML fetch + parse
-    let rawPlace = resolved.rawPlace ?? null;
-
-    if (!rawPlace) {
-      const html = await fetchPlaceHtml(resolved.placeUrl);
-      rawPlace = parsePlaceFromHtml(html, resolved.placeUrl);
-    }
-
-    // 3) normalize
+    // 2) Place fetch & parse
+    const html = await fetchPlaceHtml(resolved.placeUrl);
+    const rawPlace = parsePlaceFromHtml(html, resolved.placeUrl);
     const place = normalizePlace(rawPlace);
 
-    // 4) score
-    const scores = scorePlace(place, options.industry);
+    // 3) 자동 업종 분류
+    const auto = autoClassifyIndustry(place);
 
-    // 5) recommend (업종 프로필 기반)
-    const recommend = recommendForPlace(place, scores, options.industry);
+    // 4) 점수(Vertical 기준)
+    const scores = scorePlace(place, auto.vertical);
+
+    // 5) 추천(세부 업종 기준)
+    const recommendRaw = recommendForPlace(place, scores, auto.subcategory);
+
+    // 6) 무료/유료 마스킹 적용
+    const recommend = applyPlanToRecommend(options.plan, recommendRaw);
 
     return res.json({
       meta: {
         requestId,
         mode: input.mode,
-        industry: options.industry,
+        plan: options.plan,
+        placeUrl: resolved.placeUrl,
         confidence: resolved.confidence,
         fetchedAt: new Date().toISOString()
+      },
+      industry: {
+        vertical: auto.vertical,
+        subcategory: auto.subcategory,
+        confidence: auto.confidence,
+        reasons: auto.reasons
       },
       place,
       scores,
@@ -63,3 +71,4 @@ router.post("/analyze", async (req, res) => {
 });
 
 export default router;
+
