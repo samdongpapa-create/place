@@ -1,7 +1,7 @@
 // src/services/enrichPlace.ts
 import { fetchPlaceHtml } from "./fetchPlace.js";
 import { parsePlaceFromHtml } from "./parsePlace.js";
-import { tryFetchMenusInternal } from "./naverMenusInternal.js";
+import { tryFetchMenusInternal, type Menu as InternalMenu } from "./naverMenusInternal.js";
 
 type Menu = { name: string; price?: number; durationMin?: number; note?: string };
 
@@ -18,11 +18,12 @@ type PlaceProfileLike = {
   menus?: Menu[];
   reviews?: any;
   photos?: { count?: number };
+  // ✅ debug용 (응답에서 meta.debug랑 같이 보기 쉬움)
+  _menuDebug?: any;
 };
 
 export async function enrichPlace(place: PlaceProfileLike): Promise<PlaceProfileLike> {
   const base = basePlaceUrl(place.placeUrl);
-  const baseCandidates = buildBaseCandidates(base, place.placeId);
 
   // 1) directions
   if (!place.directions || place.directions.trim().length < 3) {
@@ -32,66 +33,55 @@ export async function enrichPlace(place: PlaceProfileLike): Promise<PlaceProfile
 
   // 2) photos
   if (!place.photos?.count) {
-    for (const b of baseCandidates) {
-      const url = `${b}/photo`;
-      try {
-        const fetched = await fetchPlaceHtml(url, { minLength: 120, retries: 1, timeoutMs: 9000 });
-        const parsed = parsePlaceFromHtml(fetched.html, fetched.finalUrl);
-
-        const merged = parsed?.photos?.count;
-        if (typeof merged === "number" && merged > 0) {
-          place.photos = { count: merged };
-          break;
-        }
-      } catch {}
-    }
+    const photoUrl = `${base}/photo`;
+    try {
+      const fetched = await fetchPlaceHtml(photoUrl, { minLength: 120, retries: 1, timeoutMs: 9000 });
+      const parsed = parsePlaceFromHtml(fetched.html, fetched.finalUrl);
+      const merged = parsed?.photos?.count;
+      if (typeof merged === "number" && merged > 0) place.photos = { count: merged };
+    } catch {}
   }
 
-  // 3) menus: HTML → (실패 시) 내부 API
+  // 3) menus: HTML tabs → (없으면) 내부 API
   if (!place.menus || place.menus.length === 0) {
+    const candidates = [`${base}/price`, `${base}/menu`, `${base}/booking`];
+
     let priceHtmlHint = "";
 
-    for (const b of baseCandidates) {
-      const candidates = [`${b}/price`, `${b}/menu`, `${b}/booking`];
-
-      for (const url of candidates) {
-        try {
-          const fetched = await fetchPlaceHtml(url, { minLength: 120, retries: 1, timeoutMs: 9000 });
-
-          // ✅ /price 힌트 저장(내부 API 시도용)
-          if (/\/price($|\?)/i.test(fetched.finalUrl) || /\/price($|\?)/i.test(url)) {
-            priceHtmlHint = fetched.html;
-          }
-
-          const parsed = parsePlaceFromHtml(fetched.html, fetched.finalUrl);
-          if (parsed?.menus && parsed.menus.length > 0) {
-            place.menus = cleanMenus(parsed.menus);
-            if (place.menus.length > 0) return place;
-          }
-        } catch {}
-      }
-    }
-
-    // ✅ 내부 API 최후 시도
-    const pid = place.placeId;
-    if (pid && priceHtmlHint) {
+    for (const url of candidates) {
       try {
-        const menus = await tryFetchMenusInternal(pid, priceHtmlHint);
-        if (menus.length > 0) {
-          place.menus = menus;
-          return place;
+        const fetched = await fetchPlaceHtml(url, { minLength: 120, retries: 1, timeoutMs: 9000 });
+
+        if (/\/price($|\?)/i.test(fetched.finalUrl) || /\/price($|\?)/i.test(url)) {
+          priceHtmlHint = fetched.html;
+        }
+
+        const parsed = parsePlaceFromHtml(fetched.html, fetched.finalUrl);
+        if (parsed?.menus && parsed.menus.length > 0) {
+          const cleaned = cleanMenus(parsed.menus);
+          if (cleaned.length > 0) {
+            place.menus = cleaned;
+            return place;
+          }
         }
       } catch {}
     }
+
+    // ✅ 내부 API 시도 + debug 저장
+    if (place.placeId && priceHtmlHint) {
+      const { menus, debug } = await tryFetchMenusInternal(place.placeId, priceHtmlHint);
+      place._menuDebug = debug;
+
+      if (menus.length > 0) {
+        place.menus = cleanMenus(menus as InternalMenu[]);
+        return place;
+      }
+    }
+  } else {
+    place.menus = cleanMenus(place.menus);
   }
 
   return place;
-}
-
-function buildBaseCandidates(base: string, placeId?: string) {
-  const out: string[] = [base];
-  if (placeId) out.push(`https://m.place.naver.com/hairshop/${placeId}`);
-  return Array.from(new Set(out));
 }
 
 function basePlaceUrl(url: string) {
