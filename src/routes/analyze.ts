@@ -61,14 +61,15 @@ router.post("/analyze", async (req, res) => {
       scores,
       recommend
     });
-  } catch (e: any) {
-    console.error(e);
-    return res.status(500).json({
-      error: "ANALYZE_FAILED",
-      message: e?.message ?? "unknown error"
-    });
-  }
-});
+} catch (e: any) {
+  console.error("❌ ANALYZE ERROR", e);
+
+  return res.status(500).json({
+    error: "ANALYZE_FAILED",
+    message: e?.message ?? "unknown error",
+    stack: process.env.NODE_ENV === "production" ? undefined : e?.stack
+  });
+}
 
 export default router;
 
