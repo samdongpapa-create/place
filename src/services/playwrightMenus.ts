@@ -180,42 +180,85 @@ function extractMenusFromParsed(parsed: any): Menu[] {
   return dedup(all);
 }
 
-// ✅ 가격탭에서 “가격표 요청”을 유발하는 클릭/스크롤 시퀀스
+// ✅ 가격탭에서 “가격표 요청”을 유발하는 강제 트리거
 async function triggerPriceRequests(page: any) {
-  // 1) 조금 기다렸다가
-  await page.waitForTimeout(1200);
+  // 0) 기본 대기
+  await page.waitForTimeout(1500);
 
-  // 2) “더보기/펼치기/가격표” 류 버튼 클릭 시도
-  const clickTexts = [
-    /더보기/i,
-    /펼치기/i,
-    /가격표/i,
-    /가격/i,
-    /시술/i,
-    /상품/i
+  // 1) 혹시 모달/팝업 닫기(있으면)
+  const closeSelectors = [
+    'button[aria-label*="닫기"]',
+    'button:has-text("닫기")',
+    'button:has-text("확인")',
+    'button:has-text("동의")',
+    '[role="button"]:has-text("닫기")'
   ];
+  for (const sel of closeSelectors) {
+    try { await page.locator(sel).first().click({ timeout: 800 }).catch(() => {}); } catch {}
+  }
 
-  for (const re of clickTexts) {
+  // 2) “가격표/시술/커트/펌/염색” 같은 칩/탭/버튼을 싹 클릭(존재하는 것만)
+  const clickWords = ["가격표", "가격", "시술", "커트", "펌", "염색", "클리닉", "두피", "드라이", "매직", "탈색", "컬러"];
+  for (const w of clickWords) {
     try {
-      const loc = page.getByText(re).first();
+      const loc = page.getByText(new RegExp(w)).first();
       if (await loc.count().catch(() => 0)) {
-        await loc.click({ timeout: 1200 }).catch(() => {});
-        await page.waitForTimeout(900);
+        await loc.click({ timeout: 900 }).catch(() => {});
+        await page.waitForTimeout(500);
       }
     } catch {}
   }
 
-  // 3) 스크롤을 더 공격적으로 (lazy load 유도)
+  // 3) 아코디언(aria-expanded=false) 같은 요소를 강제로 여러 개 열기
   try {
-    for (let i = 0; i < 5; i++) {
-      await page.mouse.wheel(0, 1800);
-      await page.waitForTimeout(900);
+    const accord = page.locator('[aria-expanded="false"]');
+    const n = Math.min(await accord.count().catch(() => 0), 12);
+    for (let i = 0; i < n; i++) {
+      await accord.nth(i).click({ timeout: 900 }).catch(() => {});
+      await page.waitForTimeout(450);
     }
   } catch {}
 
-  // 4) 마지막으로 조금 더 대기
-  await page.waitForTimeout(1200);
+  // 4) role=button / button을 무작정 몇 개 눌러서 로딩 트리거 (너무 과하면 위험하니 10개 제한)
+  try {
+    const btns = page.locator('button, [role="button"]');
+    const n = Math.min(await btns.count().catch(() => 0), 10);
+    for (let i = 0; i < n; i++) {
+      // 예약/공유 같은 버튼 오동작 방지: 텍스트가 너무 긴 건 스킵
+      const t = (await btns.nth(i).innerText().catch(() => "")) || "";
+      if (t.length > 40) continue;
+
+      await btns.nth(i).click({ timeout: 800 }).catch(() => {});
+      await page.waitForTimeout(300);
+    }
+  } catch {}
+
+  // 5) 스크롤: 윈도우 + 내부 컨테이너 둘 다 시도
+  try {
+    for (let i = 0; i < 6; i++) {
+      await page.mouse.wheel(0, 2200);
+      await page.waitForTimeout(650);
+    }
+  } catch {}
+
+  // 내부 스크롤 컨테이너(있으면)도 강제로 내리기
+  try {
+    await page.evaluate(() => {
+      const els = Array.from(document.querySelectorAll<HTMLElement>("*"));
+      const scrollables = els.filter((el) => {
+        const style = window.getComputedStyle(el);
+        const oy = style.overflowY;
+        return (oy === "auto" || oy === "scroll") && el.scrollHeight > el.clientHeight + 200;
+      });
+      scrollables.slice(0, 3).forEach((el) => (el.scrollTop = el.scrollHeight));
+    });
+    await page.waitForTimeout(900);
+  } catch {}
+
+  // 6) 추가 대기 (graphql 늦게 오기도 함)
+  await page.waitForTimeout(1500);
 }
+
 
 export async function fetchMenusViaPlaywright(targetUrl: string) {
   const debug = {
