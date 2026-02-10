@@ -4,11 +4,21 @@ import analyzeRouter from "./routes/analyze.js";
 
 const app = express();
 
-app.use(helmet());
+/**
+ * ✅ 테스트 화면에서 인라인 스크립트가 막히는 문제(CSP) 방지
+ * - 운영 전환 때는 다시 CSP 설정을 제대로 잡으면 됨
+ */
+app.use(
+  helmet({
+    contentSecurityPolicy: false, // 🔥 핵심
+    crossOriginEmbedderPolicy: false
+  })
+);
+
 app.use(express.json({ limit: "1mb" }));
 
 /**
- * 🧪 테스트용 웹 화면 (디버그 최적화 버전)
+ * 🧪 테스트용 웹 화면 (버튼 이벤트를 JS로 연결)
  */
 app.get("/", (_req, res) => {
   res.type("html").send(`
@@ -18,51 +28,15 @@ app.get("/", (_req, res) => {
   <meta charset="UTF-8" />
   <title>Place Audit Test</title>
   <style>
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", sans-serif;
-      background: #f6f7f9;
-      padding: 40px;
-    }
-    .wrap {
-      max-width: 760px;
-      margin: auto;
-      background: #fff;
-      padding: 24px;
-      border-radius: 12px;
-      box-shadow: 0 10px 30px rgba(0,0,0,.08);
-    }
-    h1 { margin-bottom: 16px; }
-    label { font-weight: 600; }
-    input, select, button {
-      width: 100%;
-      margin-top: 8px;
-      padding: 10px;
-      font-size: 14px;
-    }
-    button {
-      background: #2563eb;
-      color: #fff;
-      border: none;
-      border-radius: 8px;
-      cursor: pointer;
-      margin-top: 16px;
-    }
-    button:hover { background: #1e40af; }
-    pre {
-      margin-top: 20px;
-      background: #0f172a;
-      color: #e5e7eb;
-      padding: 16px;
-      border-radius: 8px;
-      overflow-x: auto;
-      font-size: 12px;
-      min-height: 120px;
-    }
-    .hint {
-      font-size: 12px;
-      color: #666;
-      margin-top: 8px;
-    }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", sans-serif; background:#f6f7f9; padding:40px; }
+    .wrap { max-width:760px; margin:auto; background:#fff; padding:24px; border-radius:12px; box-shadow:0 10px 30px rgba(0,0,0,.08); }
+    h1 { margin:0 0 16px; }
+    label { font-weight:600; display:block; margin-top:12px; }
+    input, select, button { width:100%; margin-top:8px; padding:10px; font-size:14px; }
+    button { background:#2563eb; color:#fff; border:none; border-radius:8px; cursor:pointer; margin-top:16px; }
+    button:hover { background:#1e40af; }
+    pre { margin-top:20px; background:#0f172a; color:#e5e7eb; padding:16px; border-radius:8px; overflow-x:auto; font-size:12px; min-height:140px; }
+    .hint { font-size:12px; color:#666; margin-top:8px; line-height:1.6; }
   </style>
 </head>
 <body>
@@ -70,10 +44,7 @@ app.get("/", (_req, res) => {
     <h1>🧪 네이버 플레이스 진단 테스트</h1>
 
     <label>네이버 플레이스 URL</label>
-    <input
-      id="placeUrl"
-      placeholder="https://m.place.naver.com/place/1234567890/home"
-    />
+    <input id="placeUrl" placeholder="https://m.place.naver.com/place/1234567890/home" />
 
     <label>요금제</label>
     <select id="plan">
@@ -81,7 +52,7 @@ app.get("/", (_req, res) => {
       <option value="pro">PRO (전체 결과)</option>
     </select>
 
-    <button onclick="analyze()">Analyze</button>
+    <button id="analyzeBtn">Analyze</button>
 
     <p class="hint">
       • FREE: 점수 + 대표 키워드 3개<br/>
@@ -92,50 +63,46 @@ app.get("/", (_req, res) => {
   </div>
 
 <script>
-async function analyze() {
-  const placeUrl = document.getElementById("placeUrl").value;
-  const plan = document.getElementById("plan").value;
+(function () {
+  const btn = document.getElementById("analyzeBtn");
   const resultEl = document.getElementById("result");
 
-  if (!placeUrl) {
-    alert("플레이스 URL을 입력하세요");
-    return;
-  }
+  btn.addEventListener("click", async () => {
+    const placeUrl = document.getElementById("placeUrl").value.trim();
+    const plan = document.getElementById("plan").value;
 
-  resultEl.textContent = "분석 중...";
+    if (!placeUrl) {
+      alert("플레이스 URL을 입력하세요");
+      return;
+    }
 
-  try {
-    const res = await fetch("/api/analyze", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        input: {
-          mode: "place_url",
-          placeUrl: placeUrl
-        },
-        options: {
-          plan: plan
-        }
-      })
-    });
+    resultEl.textContent = "분석 중...";
 
-    // 🔥 JSON 파싱 안 함 — 서버가 뭘 주든 그대로 출력
-    const text = await res.text();
-    resultEl.textContent = text;
+    try {
+      const res = await fetch("/api/analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          input: { mode: "place_url", placeUrl },
+          options: { plan }
+        })
+      });
 
-  } catch (e) {
-    resultEl.textContent = "❌ 요청 실패: " + e.message;
-  }
-}
+      // ✅ 서버가 뭘 주든 그대로 보여줌(에러도 그대로 출력)
+      const text = await res.text();
+      resultEl.textContent = text || "(빈 응답)";
+    } catch (e) {
+      resultEl.textContent = "❌ 요청 실패: " + (e && e.message ? e.message : String(e));
+    }
+  });
+})();
 </script>
 </body>
 </html>
   `);
 });
 
-app.get("/health", (_req, res) => {
-  res.json({ ok: true });
-});
+app.get("/health", (_req, res) => res.json({ ok: true }));
 
 app.use("/api", analyzeRouter);
 
