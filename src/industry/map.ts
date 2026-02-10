@@ -1,4 +1,4 @@
-import type { Vertical, Subcategory } from "./types";
+import type { Subcategory, Vertical } from "./types.js";
 
 export const SUBCATEGORY_TO_VERTICAL: Record<Subcategory, Vertical> = {
   // F&B
