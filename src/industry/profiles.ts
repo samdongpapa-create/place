@@ -1,25 +1,28 @@
-import type { Industry } from "../core/types.js";
-import { hairSalonProfile } from "./hair_salon.js";
-import { cafeProfile } from "./cafe.js";
-import { realEstateProfile } from "./real_estate.js";
-
 export type IndustryProfile = {
-  id: Industry;
-  coreIntents: string[];          // 전환 의도 템플릿
-  serviceKeywords: string[];      // 업종 서비스 키워드(추천/검증)
-  bannedPhrases: string[];        // 리스크 문구
+  subcategory: string;
+  vertical: string;
+
+  // 대표 키워드 템플릿
+  coreKeywords: string[];
+
+  // 서비스/메뉴 키워드 사전
+  serviceKeywords: string[];
+
+  // 상세설명 생성기
   descriptionTemplate: (ctx: {
     name: string;
     region: string;
-    servicesTop: string[];
-    trustPoints: string[];
+    services: string[];
+    trust: string[];
     cta: string;
   }) => string;
-  directionsTemplate: (ctx: { region: string }) => string;
-};
 
-export function getIndustryProfile(industry: Industry): IndustryProfile {
-  if (industry === "hair_salon") return hairSalonProfile;
-  if (industry === "cafe") return cafeProfile;
-  return realEstateProfile;
-}
+  // 찾아오는 길 템플릿
+  directionsTemplate: (region: string) => string;
+
+  // 사진 평가 기준
+  photoChecklist: string[];
+
+  // 금칙어 / 리스크 문구
+  bannedPhrases: string[];
+};
