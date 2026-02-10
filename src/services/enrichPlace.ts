@@ -21,49 +21,45 @@ type PlaceProfileLike = {
 
 export async function enrichPlace(place: PlaceProfileLike): Promise<PlaceProfileLike> {
   const base = basePlaceUrl(place.placeUrl);
-
-  // ✅ 0) base 후보 확장: place/{id} 로만 있으면 hairshop/{id}도 같이 시도
   const baseCandidates = buildBaseCandidates(base, place.placeId);
 
-  // ✅ 1) directions
+  // 1) directions
   if (!place.directions || place.directions.trim().length < 3) {
     const auto = autoDirections(place);
     if (auto) place.directions = auto;
   }
 
-  // ✅ 2) photos: /photo 탭
+  // 2) photos
   if (!place.photos?.count) {
     for (const b of baseCandidates) {
-      const photoUrl = `${b}/photo`;
+      const url = `${b}/photo`;
       try {
-        const fetched = await fetchPlaceHtml(photoUrl, { minLength: 120 }); // 더 완화
+        const fetched = await fetchPlaceHtml(url, { minLength: 120, retries: 1, timeoutMs: 9000 });
         const parsed = parsePlaceFromHtml(fetched.html, fetched.finalUrl);
 
-        const mergedCount = parsed?.photos?.count;
-        if (typeof mergedCount === "number" && mergedCount > 0) {
-          place.photos = { count: mergedCount };
+        const merged = parsed?.photos?.count;
+        if (typeof merged === "number" && merged > 0) {
+          place.photos = { count: merged };
           break;
-        } else {
-          const guessed = guessPhotoCountFromHtmlStrong(fetched.html);
-          if (typeof guessed === "number" && guessed > 0) {
-            place.photos = { count: guessed };
-            break;
-          }
         }
-      } catch {
-        // 다음 base로
-      }
+
+        const guessed = guessPhotoCountFromHtmlStrong(fetched.html);
+        if (typeof guessed === "number" && guessed > 0) {
+          place.photos = { count: guessed };
+          break;
+        }
+      } catch {}
     }
   }
 
-  // ✅ 3) menus: /price /menu /booking
+  // 3) menus
   if (!place.menus || place.menus.length === 0) {
     for (const b of baseCandidates) {
       const candidates = [`${b}/price`, `${b}/menu`, `${b}/booking`];
 
       for (const url of candidates) {
         try {
-          const fetched = await fetchPlaceHtml(url, { minLength: 120 }); // 더 완화
+          const fetched = await fetchPlaceHtml(url, { minLength: 120, retries: 1, timeoutMs: 9000 });
           const parsed = parsePlaceFromHtml(fetched.html, fetched.finalUrl);
 
           if (parsed?.menus && parsed.menus.length > 0) {
@@ -74,16 +70,13 @@ export async function enrichPlace(place: PlaceProfileLike): Promise<PlaceProfile
             }
           }
 
-          // fallback: 텍스트 패턴
           const guessed = guessMenusFromHtml(fetched.html);
           const cleaned2 = cleanMenus(guessed);
           if (cleaned2.length > 0) {
             place.menus = cleaned2;
             return place;
           }
-        } catch {
-          // 다음 탭
-        }
+        } catch {}
       }
     }
   } else {
@@ -95,15 +88,7 @@ export async function enrichPlace(place: PlaceProfileLike): Promise<PlaceProfile
 
 function buildBaseCandidates(base: string, placeId?: string) {
   const out: string[] = [base];
-
-  // base가 /place/{id} 형태면 hairshop도 추가
-  if (placeId) {
-    const hair = `https://m.place.naver.com/hairshop/${placeId}`;
-    if (!out.includes(hair)) out.push(hair);
-  }
-
-  // placeUrl 자체가 hairshop이면 base가 hairshop일 가능성이 높지만,
-  // 안전하게 중복 제거
+  if (placeId) out.push(`https://m.place.naver.com/hairshop/${placeId}`);
   return Array.from(new Set(out));
 }
 
@@ -137,14 +122,9 @@ function guessPhotoCountFromHtmlStrong(html: string): number | null {
     const n = Number(t[1].replace(/,/g, ""));
     if (Number.isFinite(n)) return n;
   }
-
   const urlRe = /(https?:\/\/(?:phinf\.pstatic\.net|search\.pstatic\.net|ldb-phinf\.pstatic\.net)[^"' ]+)/g;
   const matches = html.match(urlRe);
-  if (matches && matches.length > 0) {
-    const uniq = new Set(matches.map((s) => s.split("?")[0]));
-    return uniq.size;
-  }
-
+  if (matches?.length) return new Set(matches.map((s) => s.split("?")[0])).size;
   return null;
 }
 
