@@ -1,17 +1,16 @@
 // src/services/parsePlace.ts
 import * as cheerio from "cheerio";
 
-type MenuItem = { name: string; price?: string | null };
+type MenuItem = { name: string; price?: number; durationMin?: number; note?: string };
 
 export function parsePlaceFromHtml(html: string, placeUrl: string) {
   const $ = cheerio.load(html);
 
-  // 1) OG/meta 기반 최소값
   const ogTitle = $('meta[property="og:title"]').attr("content")?.trim();
   const ogDesc = $('meta[property="og:description"]').attr("content")?.trim();
   const ogUrl = $('meta[property="og:url"]').attr("content")?.trim();
 
-  // 2) ld+json 있으면 활용
+  // ld+json
   const ldjsonTexts: string[] = [];
   $('script[type="application/ld+json"]').each((_, el) => {
     const t = $(el).text()?.trim();
@@ -28,8 +27,8 @@ export function parsePlaceFromHtml(html: string, placeUrl: string) {
     })
     .filter(Boolean);
 
-  // 3) Next.js __NEXT_DATA__에서 데이터 찾기
-  const nextDataText = $('#__NEXT_DATA__').text()?.trim();
+  // __NEXT_DATA__
+  const nextDataText = $("#__NEXT_DATA__").text()?.trim();
   let nextData: any = null;
   if (nextDataText) {
     try {
@@ -39,7 +38,6 @@ export function parsePlaceFromHtml(html: string, placeUrl: string) {
     }
   }
 
-  // nextData 내부에서 place 관련 “가능성 있는 값”을 폭넓게 탐색
   const candidates: any[] = [];
   if (nextData) {
     candidates.push(nextData);
@@ -58,66 +56,45 @@ export function parsePlaceFromHtml(html: string, placeUrl: string) {
 
   const placeId = extractPlaceId(placeUrl) ?? deepFindString(candidates, ["id", "placeId", "businessId"]);
 
-  // name 후보: ogTitle가 “네이버 플레이스” 같은 공통이면 버리고, next/ld에서 찾음
-  const nameFromData =
-    deepFindString(candidates, ["name", "placeName", "bizName", "title"]) ??
-    null;
+  const nameFromData = deepFindString(candidates, ["name", "placeName", "bizName", "title"]);
+  const name = isUselessTitle(ogTitle) ? (nameFromData ?? "UNKNOWN") : (ogTitle ?? nameFromData ?? "UNKNOWN");
 
-  const name =
-    isUselessTitle(ogTitle) ? (nameFromData ?? "UNKNOWN") : (ogTitle ?? nameFromData ?? "UNKNOWN");
-
-  const category =
-    deepFindString(candidates, ["category", "categoryName", "bizCategory", "categoryLabel"]) ??
-    null;
-
-  const address =
-    deepFindString(candidates, ["address", "addr", "jibunAddress"]) ??
-    null;
-
-  const roadAddress =
-    deepFindString(candidates, ["roadAddress", "roadAddr", "newAddress"]) ??
-    null;
+  const category = deepFindString(candidates, ["category", "categoryName", "bizCategory", "categoryLabel"]) ?? undefined;
+  const address = deepFindString(candidates, ["address", "addr", "jibunAddress"]) ?? undefined;
+  const roadAddress = deepFindString(candidates, ["roadAddress", "roadAddr", "newAddress"]) ?? undefined;
 
   const description =
     deepFindString(candidates, ["description", "intro", "summary", "desc"]) ??
-    (ogDesc && !isUselessDesc(ogDesc) ? ogDesc : null);
+    (ogDesc && !isUselessDesc(ogDesc) ? ogDesc : undefined);
 
-  // 메뉴: next/ld 어디서든 “이름”만이라도 잡히면 좋음
   const menus = extractMenus(candidates);
-
-  // 태그/키워드
   const tags = extractTags(candidates);
 
-  // 리뷰/평점/사진 수 (있으면)
   const visitorCount =
-    deepFindNumber(candidates, ["visitorReviewCount", "reviewCount", "visitorReviews", "userReviewCount"]) ??
-    null;
+    deepFindNumber(candidates, ["visitorReviewCount", "reviewCount", "visitorReviews", "userReviewCount"]) ?? undefined;
 
-  const rating =
-    deepFindNumber(candidates, ["rating", "averageRating", "starRating", "score"]) ??
-    null;
+  const rating = deepFindNumber(candidates, ["rating", "averageRating", "starRating", "score"]) ?? undefined;
 
-  const photoCount =
-    deepFindNumber(candidates, ["photoCount", "imageCount", "totalPhotoCount"]) ??
-    null;
+  const photoCount = deepFindNumber(candidates, ["photoCount", "imageCount", "totalPhotoCount"]) ?? undefined;
 
+  // ✅ PlaceProfile에 맞춰 key 이름을 menus/photos로 정확히 맞춤
   return {
     placeId: placeId ?? undefined,
     placeUrl: ogUrl ?? placeUrl,
-    name: name ?? "UNKNOWN",
-    category: category ?? undefined,
-    address: address ?? undefined,
-    roadAddress: roadAddress ?? undefined,
-    description: description ?? undefined,
-    directions: undefined, // directions는 후속에서 별도 데이터로 채우는 게 안정적 (지금은 스킵)
+    name,
+    category,
+    address,
+    roadAddress,
+    description,
+    directions: undefined,
     tags: tags.length ? tags : undefined,
     menus: menus.length ? menus : undefined,
     reviews: {
-      visitorCount: typeof visitorCount === "number" ? visitorCount : undefined,
-      rating: typeof rating === "number" ? rating : undefined
+      visitorCount,
+      rating
     },
     photos: {
-      count: typeof photoCount === "number" ? photoCount : undefined
+      count: photoCount
     }
   };
 }
@@ -201,7 +178,9 @@ function asNonEmptyString(v: any): string | null {
 function asNumber(v: any): number | null {
   if (typeof v === "number" && Number.isFinite(v)) return v;
   if (typeof v === "string") {
-    const n = Number(v.replace(/[^\d.]/g, ""));
+    const cleaned = v.replace(/[^\d.]/g, "");
+    if (!cleaned) return null;
+    const n = Number(cleaned);
     if (Number.isFinite(n) && !Number.isNaN(n)) return n;
   }
   return null;
@@ -209,9 +188,8 @@ function asNumber(v: any): number | null {
 
 function extractTags(objs: any[]): string[] {
   const out = new Set<string>();
-
-  // 흔한 키들에서 태그/키워드 후보를 뽑음
   const keys = ["tags", "keywords", "hashTags", "themeTags", "services"];
+
   for (const k of keys) {
     const v = deepFindByKey(objs, k);
     if (Array.isArray(v)) {
@@ -228,26 +206,22 @@ function extractTags(objs: any[]): string[] {
 function extractMenus(objs: any[]): MenuItem[] {
   const out: MenuItem[] = [];
 
-  // ld+json Menu가 있는 경우
   for (const o of objs) {
     if (!o) continue;
 
-    // schema.org MenuItem
     const hasMenu = deepFindByKey([o], "hasMenu");
     if (hasMenu && typeof hasMenu === "object") {
       const items = (hasMenu?.hasMenuSection ?? hasMenu?.itemListElement ?? []) as any[];
-      const extracted = menuFromAny(items);
-      out.push(...extracted);
+      out.push(...menuFromAny(items));
     }
 
-    // 일반 menu/items 키
     const menuLike = deepFindByKey([o], "menus") ?? deepFindByKey([o], "menu") ?? deepFindByKey([o], "items");
     if (Array.isArray(menuLike)) {
       out.push(...menuFromAny(menuLike));
     }
   }
 
-  // 중복 제거
+  // ✅ 중복 제거 (name 기준)
   const dedup = new Map<string, MenuItem>();
   for (const m of out) {
     if (!m?.name) continue;
@@ -259,11 +233,25 @@ function extractMenus(objs: any[]): MenuItem[] {
 
 function menuFromAny(arr: any[]): MenuItem[] {
   const out: MenuItem[] = [];
+
   for (const it of arr) {
     const name = asNonEmptyString(it?.name ?? it?.title ?? it);
     if (!name) continue;
-    const price = asNonEmptyString(it?.price ?? it?.offers?.price ?? it?.cost);
-    out.push({ name, price: price ?? null });
+
+    // ✅ price는 number로만 넣고, 못 바꾸면 아예 생략
+    const rawPrice = it?.price ?? it?.offers?.price ?? it?.cost ?? it?.priceValue;
+    const price = asNumber(rawPrice) ?? undefined;
+
+    const durationMin = asNumber(it?.durationMin ?? it?.duration ?? it?.time) ?? undefined;
+    const note = asNonEmptyString(it?.note ?? it?.desc ?? it?.description) ?? undefined;
+
+    const item: MenuItem = { name };
+    if (typeof price === "number") item.price = price;
+    if (typeof durationMin === "number") item.durationMin = durationMin;
+    if (note) item.note = note;
+
+    out.push(item);
   }
+
   return out;
 }
