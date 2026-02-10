@@ -19,7 +19,11 @@ export function parsePlaceFromHtml(html: string, placeUrl: string) {
 
   const ldObjects = ldjsonTexts
     .map((t) => {
-      try { return JSON.parse(t); } catch { return null; }
+      try {
+        return JSON.parse(t);
+      } catch {
+        return null;
+      }
     })
     .filter(Boolean);
 
@@ -27,7 +31,11 @@ export function parsePlaceFromHtml(html: string, placeUrl: string) {
   const nextDataText = $("#__NEXT_DATA__").text()?.trim();
   let nextData: any = null;
   if (nextDataText) {
-    try { nextData = JSON.parse(nextDataText); } catch { nextData = null; }
+    try {
+      nextData = JSON.parse(nextDataText);
+    } catch {
+      nextData = null;
+    }
   }
 
   // ✅ dehydrated queries + candidates 구성
@@ -52,13 +60,12 @@ export function parsePlaceFromHtml(html: string, placeUrl: string) {
   }
   for (const obj of ldObjects) candidates.push(obj);
 
-  const placeId = extractPlaceId(placeUrl)
-    ?? deepFindString(candidates, ["placeId", "businessId", "id"])
-    ?? undefined;
+  const placeId =
+    extractPlaceId(placeUrl) ?? deepFindString(candidates, ["placeId", "businessId", "id"]) ?? undefined;
 
   // name
   const nameFromData = deepFindString(candidates, ["placeName", "bizName", "name", "title"]);
-  const rawName = isUselessTitle(ogTitle) ? (nameFromData ?? "UNKNOWN") : (ogTitle ?? nameFromData ?? "UNKNOWN");
+  const rawName = isUselessTitle(ogTitle) ? nameFromData ?? "UNKNOWN" : ogTitle ?? nameFromData ?? "UNKNOWN";
   const name = cleanupName(rawName);
 
   const category = deepFindString(candidates, ["categoryName", "category", "bizCategory", "categoryLabel"]) ?? undefined;
@@ -76,17 +83,14 @@ export function parsePlaceFromHtml(html: string, placeUrl: string) {
     if (alt) description = alt;
   }
 
-  // ✅ 대표키워드(= 실제로 설정된 키워드) 먼저 추출
+  // ✅ "기존 대표키워드" (진짜 대표키워드만)
   const keywords = extractRepresentativeKeywords($, queryDatas, candidates);
 
   // 기존 tags는 그대로(시설/서비스/해시태그 등 넓게)
   const tags = extractTags(candidates);
 
-  // menus (너는 이제 메뉴/가격 빼기로 했으니, 유지해도 되고 없어도 됨)
-  const menus =
-    extractMenusFromQueries(queryDatas)
-    .concat(extractMenusEnhanced(candidates));
-
+  // menus (너가 메뉴/가격을 안 쓰면 주석 처리 가능)
+  const menus = extractMenusFromQueries(queryDatas).concat(extractMenusEnhanced(candidates));
   const dedupMenus = dedupMenu(menus);
 
   const visitorCount =
@@ -104,7 +108,9 @@ export function parsePlaceFromHtml(html: string, placeUrl: string) {
   const photoCount =
     typeof photoCountFromKeys === "number"
       ? photoCountFromKeys
-      : (typeof photoCountFromArrays === "number" ? photoCountFromArrays : undefined);
+      : typeof photoCountFromArrays === "number"
+      ? photoCountFromArrays
+      : undefined;
 
   return {
     placeId,
@@ -115,9 +121,9 @@ export function parsePlaceFromHtml(html: string, placeUrl: string) {
     roadAddress,
     description,
     directions: undefined,
-    keywords: keywords.length ? keywords : undefined, // ✅ 추가
+    keywords: keywords.length ? keywords : undefined, // ✅ 기존 대표키워드
     tags: tags.length ? tags : undefined,
-    // menus: dedupMenus.length ? dedupMenus : undefined, // ✅ 메뉴/가격 안 쓰면 여기 주석 처리해도 됨
+    // menus: dedupMenus.length ? dedupMenus : undefined, // ✅ 메뉴/가격 안 쓰면 주석 처리
     reviews: {
       visitorCount,
       blogCount,
@@ -220,84 +226,206 @@ function asNumber(v: any): number | null {
 }
 
 /**
- * ✅ “대표키워드” 추출
+ * ✅ "기존 대표키워드"만 최대한 정확하게 추출
  * 우선순위:
- * 1) queryDatas/candidates 안의 대표키워드 계열 키
- * 2) DOM에서 키워드 칩(버튼/링크 텍스트) 훑기
+ * 1) queryDatas/candidates 안의 대표키워드 전용 키
+ * 2) (불가피 시) candidates 안의 일반 keywords 계열 중 "가장 그럴듯한 배열" 1개 선택
+ * 3) DOM에서는 "대표키워드" 섹션 근처에서만 칩 텍스트 수집 (페이지 전체 훑기 금지)
  */
 function extractRepresentativeKeywords($: cheerio.CheerioAPI, queryDatas: any[], candidates: any[]): string[] {
-  const out = new Set<string>();
-
-  // 1) 데이터 키 기반
-  const keywordKeys = [
-    "representativeKeywords",
-    "representativeKeyword",
-    "keywords",
-    "keywordList",
-    "placeKeywords",
-    "searchKeywords",
-    "bizKeywords",
-    "hashTags",
-    "themeTags"
-  ];
-
-  for (const k of keywordKeys) {
-    const v1 = deepFindByKey(queryDatas, k);
-    pushKeywords(out, v1);
-
-    const v2 = deepFindByKey(candidates, k);
-    pushKeywords(out, v2);
-  }
-
-  // 2) DOM 기반(키워드 칩/태그)
-  // 너무 공격적으로 잡지 않도록: 길이 제한 + 숫자/리뷰문구 제외
-  const chipTexts: string[] = [];
-  $("a,button,span,div").each((_, el) => {
-    const t = $(el).text()?.trim();
-    if (!t) return;
-    if (t.length < 2 || t.length > 18) return;
-    if (/방문자리뷰|블로그리뷰|예약|길찾기|공유|전화/i.test(t)) return;
-    if (/^\d+$/.test(t)) return;
-    if (!/[가-힣A-Za-z]/.test(t)) return;
-    chipTexts.push(t);
-  });
-
-  // “키워드”일 법한 것만: 너무 흔한 UI 문구 제거
-  const stop = new Set([
-    "홈","메뉴","사진","리뷰","예약","가격","지도","정보","더보기","펼치기","접기","저장"
+  // 최소 stoplist (UI/리뷰/버튼)
+  const STOP = new Set([
+    "홈", "메뉴", "사진", "리뷰", "예약", "가격", "지도", "정보", "더보기", "펼치기", "접기", "저장",
+    "문의", "소식", "스타일", "마이플레이스"
   ]);
 
-  for (const t of chipTexts) {
-    const x = t.replace(/^#/, "").trim();
-    if (stop.has(x)) continue;
-    if (x.length < 2) continue;
-    out.add(x);
-    if (out.size >= 20) break;
+  const NOISE_RE = /(이미지\s*갯수|방문자\s*리뷰|블로그\s*리뷰|길찾기|공유|전화|영업시간|알림|쿠폰|주차)/i;
+
+  const seen = new Set<string>();
+  const out: string[] = [];
+
+  const pushOne = (raw: string) => {
+    const t = (raw || "").replace(/^#/, "").replace(/\s+/g, " ").trim();
+    if (!t) return;
+    if (t.length < 2 || t.length > 22) return;
+    if (!/[가-힣A-Za-z]/.test(t)) return;
+    if (NOISE_RE.test(t)) return;
+    if (STOP.has(t)) return;
+    if (/^\d+$/.test(t)) return;
+
+    if (seen.has(t)) return;
+    seen.add(t);
+    out.push(t);
+  };
+
+  // (1) 전용 키 우선: representativeKeywords 계열
+  const primaryKeys = [
+    "representativeKeywords",
+    "representativeKeyword",
+    "placeKeywords",
+    "searchKeywords",
+    "bizKeywords"
+  ];
+
+  for (const k of primaryKeys) {
+    pushKeywordsByValue(pushOne, deepFindByKey(queryDatas, k));
+    pushKeywordsByValue(pushOne, deepFindByKey(candidates, k));
+    if (out.length >= 5) break; // 전용키에서 어느 정도 나오면 충분
   }
 
-  return Array.from(out).slice(0, 15);
+  // (2) 일반 keywords 계열은 "모든 걸 다 넣지 말고", 후보 배열을 모아 "가장 그럴듯한 1개"만 선택
+  if (out.length < 3) {
+    const genericKeys = ["keywords", "keywordList", "hashTags", "themeTags", "tags"];
+    const arrays: string[][] = [];
+
+    for (const k of genericKeys) {
+      collectKeywordArrays(arrays, deepFindByKey(queryDatas, k));
+      collectKeywordArrays(arrays, deepFindByKey(candidates, k));
+    }
+
+    const best = pickBestKeywordArray(arrays, STOP, NOISE_RE);
+    if (best?.length) {
+      for (const t of best) pushOne(t);
+    }
+  }
+
+  // (3) DOM 폴백: "대표키워드" 근처에서만 칩 텍스트 수집
+  if (out.length < 3) {
+    const domPicked = extractKeywordChipsNearLabel($, "대표키워드");
+    for (const t of domPicked) pushOne(t);
+  }
+
+  return out.slice(0, 15);
 }
 
-function pushKeywords(out: Set<string>, v: any) {
+function pushKeywordsByValue(pushOne: (s: string) => void, v: any) {
   if (!v) return;
 
   if (Array.isArray(v)) {
     for (const it of v) {
       const s = asNonEmptyString(it?.name ?? it?.title ?? it?.keyword ?? it);
-      if (s) out.add(s.replace(/^#/, "").trim());
+      if (s) pushOne(s);
+    }
+    return;
+  }
+
+  if (typeof v === "object") {
+    const arr = v.items ?? v.list ?? v.keywords ?? v.tags ?? v.representativeKeywords ?? undefined;
+    if (Array.isArray(arr)) {
+      for (const it of arr) {
+        const s = asNonEmptyString(it?.name ?? it?.title ?? it?.keyword ?? it);
+        if (s) pushOne(s);
+      }
+    } else {
+      // 단일 문자열 케이스
+      const s = asNonEmptyString(v.keyword ?? v.name ?? v.title);
+      if (s) pushOne(s);
+    }
+  }
+}
+
+function collectKeywordArrays(out: string[][], v: any) {
+  if (!v) return;
+
+  if (Array.isArray(v)) {
+    // string[]이면 후보
+    if (v.length && v.every((x) => typeof x === "string")) {
+      out.push(v as string[]);
+    } else {
+      // object[]이면 name/title/keyword로 string[] 변환 후보도 만든다
+      const mapped: string[] = [];
+      for (const it of v) {
+        const s = asNonEmptyString(it?.name ?? it?.title ?? it?.keyword ?? it);
+        if (s) mapped.push(s);
+      }
+      if (mapped.length >= 3) out.push(mapped);
     }
     return;
   }
 
   if (typeof v === "object") {
     const arr = v.items ?? v.list ?? v.keywords ?? v.tags ?? undefined;
-    if (Array.isArray(arr)) {
-      for (const it of arr) {
-        const s = asNonEmptyString(it?.name ?? it?.title ?? it?.keyword ?? it);
-        if (s) out.add(s.replace(/^#/, "").trim());
-      }
-    }
+    if (Array.isArray(arr)) collectKeywordArrays(out, arr);
   }
+}
+
+/**
+ * 후보 배열 중 "대표키워드일 가능성이 가장 높은" 배열 하나 선택
+ * - 길이 3~20 선호
+ * - UI 잡음 적을수록 가산
+ * - 토큰이 너무 길거나 숫자/리뷰문구면 감점
+ */
+function pickBestKeywordArray(arrays: string[][], STOP: Set<string>, NOISE_RE: RegExp): string[] | null {
+  if (!arrays.length) return null;
+
+  const score = (arr: string[]) => {
+    const a = arr.map((x) => (x || "").replace(/^#/, "").trim()).filter(Boolean);
+
+    let s = 0;
+    const len = a.length;
+
+    if (len >= 3 && len <= 20) s += 4;
+    if (len >= 5 && len <= 15) s += 3;
+
+    let good = 0;
+    let noise = 0;
+
+    for (const t of a) {
+      if (t.length < 2 || t.length > 22) noise++;
+      if (!/[가-힣A-Za-z]/.test(t)) noise++;
+      if (/^\d+$/.test(t)) noise++;
+      if (STOP.has(t)) noise++;
+      if (NOISE_RE.test(t)) noise++;
+      if (!STOP.has(t) && !NOISE_RE.test(t) && /[가-힣A-Za-z]/.test(t) && t.length <= 22) good++;
+    }
+
+    s += Math.min(good, 10);
+    s -= noise * 2;
+
+    return s;
+  };
+
+  const sorted = arrays
+    .map((a) => ({ a, s: score(a) }))
+    .sort((x, y) => y.s - x.s);
+
+  return sorted[0]?.a ?? null;
+}
+
+/**
+ * DOM에서 "대표키워드" 라벨 근처에 붙은 칩/태그 텍스트만 수집
+ * - 페이지 전체를 훑지 않음
+ */
+function extractKeywordChipsNearLabel($: cheerio.CheerioAPI, label: string): string[] {
+  const out: string[] = [];
+
+  // label 포함하는 요소를 찾고, 그 부모/근처에서 a/button/span 텍스트 수집
+  const labelEls = $(`*:contains("${label}")`).toArray().slice(0, 6);
+
+  for (const el of labelEls) {
+    const $el = $(el);
+    const parent = $el.parent();
+    const scope = parent.length ? parent : $el;
+
+    const texts: string[] = [];
+    scope.find("a,button,span,div").each((_, chip) => {
+      const t = $(chip).text()?.trim();
+      if (!t) return;
+      if (t === label) return;
+      texts.push(t);
+    });
+
+    // 너무 많이 담지 말고, 짧은 텍스트 위주로
+    for (const t of texts) {
+      const x = t.replace(/\s+/g, " ").trim();
+      if (x.length < 2 || x.length > 22) continue;
+      out.push(x);
+      if (out.length >= 20) break;
+    }
+    if (out.length >= 5) break;
+  }
+
+  return out;
 }
 
 function extractTags(objs: any[]): string[] {
@@ -321,10 +449,19 @@ function extractTags(objs: any[]): string[] {
 function extractMenusFromQueries(queryDatas: any[]): MenuItem[] {
   const out: MenuItem[] = [];
   const keys = [
-    "priceList", "priceLists", "priceItems", "prices",
-    "serviceItems", "services", "treatments", "treatmentItems",
-    "menu", "menus", "items",
-    "bookingProducts", "products"
+    "priceList",
+    "priceLists",
+    "priceItems",
+    "prices",
+    "serviceItems",
+    "services",
+    "treatments",
+    "treatmentItems",
+    "menu",
+    "menus",
+    "items",
+    "bookingProducts",
+    "products"
   ];
 
   for (const data of queryDatas) {
@@ -344,9 +481,17 @@ function extractMenusFromQueries(queryDatas: any[]): MenuItem[] {
 function extractMenusEnhanced(objs: any[]): MenuItem[] {
   const out: MenuItem[] = [];
   const menuKeys = [
-    "menus", "menu", "items",
-    "priceList", "priceLists", "priceItems", "prices",
-    "services", "serviceItems", "treatments", "treatmentItems",
+    "menus",
+    "menu",
+    "items",
+    "priceList",
+    "priceLists",
+    "priceItems",
+    "prices",
+    "services",
+    "serviceItems",
+    "treatments",
+    "treatmentItems",
     "products"
   ];
 
@@ -413,3 +558,4 @@ function estimatePhotoCountFromArrays(objs: any[]): number | null {
   }
   return best > 0 ? best : null;
 }
+
