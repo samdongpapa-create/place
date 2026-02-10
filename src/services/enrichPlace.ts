@@ -1,6 +1,7 @@
 // src/services/enrichPlace.ts
 import { fetchPlaceHtml } from "./fetchPlace.js";
 import { parsePlaceFromHtml } from "./parsePlace.js";
+import { tryFetchMenusInternal } from "./naverMenusInternal.js";
 
 type Menu = { name: string; price?: number; durationMin?: number; note?: string };
 
@@ -42,45 +43,46 @@ export async function enrichPlace(place: PlaceProfileLike): Promise<PlaceProfile
           place.photos = { count: merged };
           break;
         }
-
-        const guessed = guessPhotoCountFromHtmlStrong(fetched.html);
-        if (typeof guessed === "number" && guessed > 0) {
-          place.photos = { count: guessed };
-          break;
-        }
       } catch {}
     }
   }
 
-  // 3) menus
+  // 3) menus: HTML → (실패 시) 내부 API
   if (!place.menus || place.menus.length === 0) {
+    let priceHtmlHint = "";
+
     for (const b of baseCandidates) {
       const candidates = [`${b}/price`, `${b}/menu`, `${b}/booking`];
 
       for (const url of candidates) {
         try {
           const fetched = await fetchPlaceHtml(url, { minLength: 120, retries: 1, timeoutMs: 9000 });
-          const parsed = parsePlaceFromHtml(fetched.html, fetched.finalUrl);
 
-          if (parsed?.menus && parsed.menus.length > 0) {
-            const cleaned = cleanMenus(parsed.menus);
-            if (cleaned.length > 0) {
-              place.menus = cleaned;
-              return place;
-            }
+          // ✅ /price 힌트 저장(내부 API 시도용)
+          if (/\/price($|\?)/i.test(fetched.finalUrl) || /\/price($|\?)/i.test(url)) {
+            priceHtmlHint = fetched.html;
           }
 
-          const guessed = guessMenusFromHtml(fetched.html);
-          const cleaned2 = cleanMenus(guessed);
-          if (cleaned2.length > 0) {
-            place.menus = cleaned2;
-            return place;
+          const parsed = parsePlaceFromHtml(fetched.html, fetched.finalUrl);
+          if (parsed?.menus && parsed.menus.length > 0) {
+            place.menus = cleanMenus(parsed.menus);
+            if (place.menus.length > 0) return place;
           }
         } catch {}
       }
     }
-  } else {
-    place.menus = cleanMenus(place.menus);
+
+    // ✅ 내부 API 최후 시도
+    const pid = place.placeId;
+    if (pid && priceHtmlHint) {
+      try {
+        const menus = await tryFetchMenusInternal(pid, priceHtmlHint);
+        if (menus.length > 0) {
+          place.menus = menus;
+          return place;
+        }
+      } catch {}
+    }
   }
 
   return place;
@@ -114,41 +116,6 @@ function autoDirections(place: PlaceProfileLike): string | null {
 function extractStationFromName(name: string) {
   const m = name.match(/([가-힣A-Za-z]+역)/);
   return m?.[1] ?? null;
-}
-
-function guessPhotoCountFromHtmlStrong(html: string): number | null {
-  const t = html.match(/사진\s*([0-9][0-9,]*)/);
-  if (t?.[1]) {
-    const n = Number(t[1].replace(/,/g, ""));
-    if (Number.isFinite(n)) return n;
-  }
-  const urlRe = /(https?:\/\/(?:phinf\.pstatic\.net|search\.pstatic\.net|ldb-phinf\.pstatic\.net)[^"' ]+)/g;
-  const matches = html.match(urlRe);
-  if (matches?.length) return new Set(matches.map((s) => s.split("?")[0])).size;
-  return null;
-}
-
-function guessMenusFromHtml(html: string): Menu[] {
-  const out: Menu[] = [];
-  const re = /([가-힣A-Za-z][가-힣A-Za-z0-9\s·()]{1,40})\s*([0-9][0-9,]{2,8})\s*원/g;
-
-  let m: RegExpExecArray | null;
-  const seen = new Set<string>();
-
-  while ((m = re.exec(html))) {
-    const name = m[1].trim().replace(/\s+/g, " ");
-    const price = Number(m[2].replace(/,/g, ""));
-    if (!name || !Number.isFinite(price)) continue;
-    if (looksLikeParkingFee(name)) continue;
-
-    const key = `${name}:${price}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-
-    out.push({ name, price });
-    if (out.length >= 30) break;
-  }
-  return out;
 }
 
 function looksLikeParkingFee(name: string) {
