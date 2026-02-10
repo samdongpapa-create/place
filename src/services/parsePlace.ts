@@ -30,10 +30,14 @@ export function parsePlaceFromHtml(html: string, placeUrl: string) {
     try { nextData = JSON.parse(nextDataText); } catch { nextData = null; }
   }
 
+  // ✅ NEW: script blob에서 state JSON을 “통째로” 캐치
+  const scriptStateObjects = extractStateObjectsFromScripts($, html, extractPlaceId(placeUrl));
+
   // ✅ dehydrated queries를 “풀 스캔”해서 place 핵심 데이터 블록을 찾음
   const queryDatas: any[] = [];
   const candidates: any[] = [];
 
+  // 우선순위: nextData → scriptState → ld
   if (nextData) {
     candidates.push(nextData);
     const pp = nextData?.props?.pageProps;
@@ -50,9 +54,15 @@ export function parsePlaceFromHtml(html: string, placeUrl: string) {
       }
     }
   }
+
+  for (const o of scriptStateObjects) {
+    candidates.push(o);
+  }
+
   for (const obj of ldObjects) candidates.push(obj);
 
-  const placeId = extractPlaceId(placeUrl)
+  const placeId =
+    extractPlaceId(placeUrl)
     ?? deepFindString(candidates, ["placeId", "businessId", "id"])
     ?? undefined;
 
@@ -78,10 +88,10 @@ export function parsePlaceFromHtml(html: string, placeUrl: string) {
 
   const tags = extractTags(candidates);
 
-  // ✅ 핵심: menus는 일반 candidates 말고 “queryDatas”를 우선적으로, 더 공격적으로 추출
+  // ✅ menus: queryDatas 우선 + candidates
   const menus =
-    extractMenusFromQueries(queryDatas) // 1순위
-    .concat(extractMenusEnhanced(candidates)); // 2순위(기존 방식)
+    extractMenusFromQueries(queryDatas)
+      .concat(extractMenusEnhanced(candidates));
 
   const dedupMenus = dedupMenu(menus);
 
@@ -122,6 +132,126 @@ export function parsePlaceFromHtml(html: string, placeUrl: string) {
       count: photoCount
     }
   };
+}
+
+/**
+ * ✅ NEW: 모든 script 텍스트에서 "state blob"을 찾아 JSON으로 뽑아 candidates에 넣는다.
+ * - __NEXT_DATA__가 없을 때도 데이터가 window.__APOLLO_STATE__/__INITIAL_STATE__ 등에 들어가는 케이스 대응
+ */
+function extractStateObjectsFromScripts($: cheerio.CheerioAPI, rawHtml: string, placeIdHint: string | null) {
+  const out: any[] = [];
+
+  // 1) window.__SOMETHING__ = {...} 형태
+  const assignKeys = [
+    "__APOLLO_STATE__",
+    "__INITIAL_STATE__",
+    "__PLACE_STATE__",
+    "__PRELOADED_STATE__",
+    "__STATE__"
+  ];
+
+  const scripts: string[] = [];
+  $("script").each((_, el) => {
+    const t = $(el).text();
+    if (t && t.length > 200) scripts.push(t);
+  });
+
+  // HTML 자체에도 있을 수 있어 큰 덩어리로도 훑어줌(안전장치)
+  if (rawHtml && rawHtml.length > 2000) scripts.push(rawHtml);
+
+  for (const text of scripts) {
+    // 너무 큰 건 비용이 크니 우선 placeId 힌트가 있으면 그걸 포함하는 덩어리만 우선
+    if (placeIdHint && text.length > 5000 && !text.includes(placeIdHint)) {
+      // 힌트가 없으면 스킵 (성능)
+      continue;
+    }
+
+    for (const k of assignKeys) {
+      const obj = extractAssignedJsonObject(text, k);
+      if (obj) out.push(obj);
+    }
+
+    // 2) "dehydratedState"나 "apollo" 같은 키워드가 있으면, json object를 강제로 추출 시도
+    if (/dehydratedstate|apollo|graphql|price|menu/i.test(text)) {
+      const obj2 = extractFirstLargeJsonObject(text);
+      if (obj2) out.push(obj2);
+    }
+  }
+
+  // 중복 제거(완벽하진 않아도 됨)
+  return out.slice(0, 8);
+}
+
+function extractAssignedJsonObject(text: string, key: string): any | null {
+  // window.__APOLLO_STATE__ = {...};
+  const re = new RegExp(`(?:window\\.)?${escapeRegExp(key)}\\s*=\\s*({)`, "m");
+  const m = re.exec(text);
+  if (!m || m.index == null) return null;
+
+  const start = text.indexOf("{", m.index);
+  if (start < 0) return null;
+
+  const jsonStr = sliceBalancedBraces(text, start, 2_000_000);
+  if (!jsonStr) return null;
+
+  try {
+    return JSON.parse(jsonStr);
+  } catch {
+    return null;
+  }
+}
+
+function extractFirstLargeJsonObject(text: string): any | null {
+  const start = text.indexOf("{");
+  if (start < 0) return null;
+  const jsonStr = sliceBalancedBraces(text, start, 1_200_000);
+  if (!jsonStr) return null;
+  try {
+    const obj = JSON.parse(jsonStr);
+    // 너무 작은 건 의미 없을 확률 높음
+    if (obj && typeof obj === "object") return obj;
+  } catch {}
+  return null;
+}
+
+function sliceBalancedBraces(text: string, start: number, maxLen: number): string | null {
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+
+  const endLimit = Math.min(text.length, start + maxLen);
+
+  for (let i = start; i < endLimit; i++) {
+    const ch = text[i];
+
+    if (inStr) {
+      if (esc) {
+        esc = false;
+      } else if (ch === "\\") {
+        esc = true;
+      } else if (ch === '"') {
+        inStr = false;
+      }
+      continue;
+    } else {
+      if (ch === '"') {
+        inStr = true;
+        continue;
+      }
+      if (ch === "{") depth++;
+      if (ch === "}") {
+        depth--;
+        if (depth === 0) {
+          return text.slice(start, i + 1);
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function escapeRegExp(s: string) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function cleanupName(n: string) {
@@ -229,14 +359,9 @@ function extractTags(objs: any[]): string[] {
   return Array.from(out).slice(0, 15);
 }
 
-/**
- * ✅ queryDatas에서 메뉴를 직접 찾는 로직
- * - q.state.data 안에 price/service/treatment 배열이 들어있는 케이스 대응
- */
 function extractMenusFromQueries(queryDatas: any[]): MenuItem[] {
   const out: MenuItem[] = [];
 
-  // menus가 들어있을 법한 키들
   const keys = [
     "priceList", "priceLists", "priceItems", "prices",
     "serviceItems", "services", "treatments", "treatmentItems",
@@ -247,7 +372,6 @@ function extractMenusFromQueries(queryDatas: any[]): MenuItem[] {
   for (const data of queryDatas) {
     if (!data) continue;
 
-    // 1) 키 기반 추출
     for (const k of keys) {
       const v = deepFindByKey([data], k);
       if (Array.isArray(v)) out.push(...menuFromAny(v));
@@ -257,16 +381,14 @@ function extractMenusFromQueries(queryDatas: any[]): MenuItem[] {
       }
     }
 
-    // 2) “배열 중에 name+price 비슷한 구조”를 통째로 훑는 fallback
     const foundArrays = collectArrays(data, 0);
     for (const arr of foundArrays) {
-      // 너무 짧으면 스킵
       if (arr.length < 2) continue;
 
-      // 샘플 3개를 보고 menu 가능성 체크
       const sample = arr.slice(0, 3);
-      const ok = sample.some((it: any) => asNonEmptyString(it?.name ?? it?.title ?? it?.menuName ?? it?.serviceName)) &&
-                 sample.some((it: any) => asNumber(it?.price ?? it?.minPrice ?? it?.maxPrice ?? it?.amount ?? it?.value));
+      const ok =
+        sample.some((it: any) => asNonEmptyString(it?.name ?? it?.title ?? it?.menuName ?? it?.serviceName)) &&
+        sample.some((it: any) => asNumber(it?.price ?? it?.minPrice ?? it?.maxPrice ?? it?.amount ?? it?.value));
       if (!ok) continue;
 
       out.push(...menuFromAny(arr));
@@ -343,7 +465,6 @@ function dedupMenu(menus: MenuItem[]): MenuItem[] {
     if (!name) continue;
     if (!/[가-힣A-Za-z]/.test(name)) continue;
 
-    // 미용실 기준 너무 작은 가격은 제외
     if (typeof m.price === "number" && m.price < 5000) continue;
 
     const key = `${name}:${m.price ?? "na"}`;
