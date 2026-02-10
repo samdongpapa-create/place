@@ -96,7 +96,12 @@ function normalizeFromItem(it: any): Menu | null {
   // ✅ 서비스 키워드도 없고 price/time도 없으면 버림(오탐 방지)
   if (!looksHairService(name) && typeof price !== "number" && typeof durationMin !== "number") return null;
 
-  return { name, ...(typeof price === "number" ? { price } : {}), ...(durationMin ? { durationMin } : {}), ...(note ? { note } : {}) };
+  return {
+    name,
+    ...(typeof price === "number" ? { price } : {}),
+    ...(durationMin ? { durationMin } : {}),
+    ...(note ? { note } : {})
+  };
 }
 
 function dedup(menus: Menu[]) {
@@ -152,11 +157,64 @@ function keysPreview(x: any): string[] {
 }
 
 function safeJsonParse(s: string): any | null {
-  try {
-    return JSON.parse(s);
-  } catch {
-    return null;
+  try { return JSON.parse(s); } catch { return null; }
+}
+
+// ✅ 배치 응답([ {data...}, {data...} ])에서도 data 유무 판단
+function batchHasData(parsed: any): boolean {
+  if (Array.isArray(parsed)) return parsed.some((x) => x && typeof x === "object" && !!x.data);
+  if (parsed && typeof parsed === "object") return !!parsed.data;
+  return false;
+}
+
+// ✅ 배치 응답이면 각 요소도 같이 훑어서 메뉴를 찾음
+function extractMenusFromParsed(parsed: any): Menu[] {
+  const all: Menu[] = [];
+  if (Array.isArray(parsed)) {
+    for (const el of parsed) all.push(...extractMenusHeuristic(el));
+    // 전체 배열 자체에서도 훑기(중첩 구조 케이스)
+    all.push(...extractMenusHeuristic(parsed));
+  } else {
+    all.push(...extractMenusHeuristic(parsed));
   }
+  return dedup(all);
+}
+
+// ✅ 가격탭에서 “가격표 요청”을 유발하는 클릭/스크롤 시퀀스
+async function triggerPriceRequests(page: any) {
+  // 1) 조금 기다렸다가
+  await page.waitForTimeout(1200);
+
+  // 2) “더보기/펼치기/가격표” 류 버튼 클릭 시도
+  const clickTexts = [
+    /더보기/i,
+    /펼치기/i,
+    /가격표/i,
+    /가격/i,
+    /시술/i,
+    /상품/i
+  ];
+
+  for (const re of clickTexts) {
+    try {
+      const loc = page.getByText(re).first();
+      if (await loc.count().catch(() => 0)) {
+        await loc.click({ timeout: 1200 }).catch(() => {});
+        await page.waitForTimeout(900);
+      }
+    } catch {}
+  }
+
+  // 3) 스크롤을 더 공격적으로 (lazy load 유도)
+  try {
+    for (let i = 0; i < 5; i++) {
+      await page.mouse.wheel(0, 1800);
+      await page.waitForTimeout(900);
+    }
+  } catch {}
+
+  // 4) 마지막으로 조금 더 대기
+  await page.waitForTimeout(1200);
 }
 
 export async function fetchMenusViaPlaywright(targetUrl: string) {
@@ -197,13 +255,12 @@ export async function fetchMenusViaPlaywright(targetUrl: string) {
       if (!/graphql/i.test(url)) return;
 
       debug.capturedUrls.push(url);
-      if (debug.capturedUrls.length > 80) return;
+      if (debug.capturedUrls.length > 120) return;
 
       if (req.method() === "POST") {
         const post = req.postData() || "";
         const head = post.slice(0, 280);
 
-        // ✅ postData가 배열(batched graphql)일 수도 있어서 케이스 분기
         let op: string | undefined;
         let varsKeys: string[] | undefined;
 
@@ -235,16 +292,15 @@ export async function fetchMenusViaPlaywright(targetUrl: string) {
       const ct = (res.headers()["content-type"] || "").toLowerCase();
 
       try {
-        // ✅ 무조건 text로 먼저 받고, JSON 파싱은 우리가 한다 (네 지금 증상 해결 핵심)
+        // ✅ 무조건 text로 받고 JSON을 우리가 파싱
         const text = await res.text();
         const head = text.slice(0, 320);
-
         const parsed = safeJsonParse(text);
 
         debug.jsonResponses++;
 
         const topKeys = keysPreview(parsed ?? text);
-        const hasDataKey = !!(parsed && typeof parsed === "object" && !Array.isArray(parsed) && (parsed as any).data);
+        const hasDataKey = batchHasData(parsed);
         const arraysFound = parsed ? collectArrays(parsed, 0).length : 0;
 
         debug.capturedGraphqlSamples.push({
@@ -256,25 +312,21 @@ export async function fetchMenusViaPlaywright(targetUrl: string) {
           rawResponseHead: head
         });
 
-        // ✅ 파싱 성공했을 때만 메뉴 탐색
         if (parsed) {
-          const found = extractMenusHeuristic(parsed);
+          const found = extractMenusFromParsed(parsed);
           if (found.length) menus.push(...found);
         }
-      } catch {
-        // ignore
-      }
+      } catch {}
     });
 
-    await page.goto(targetUrl, { waitUntil: "networkidle", timeout: 25000 });
+    // ✅ 여기 중요: networkidle로 바로 끝내지 말고, domcontentloaded 후 액션으로 호출 유도
+    await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
 
-    // booking은 스크롤로 추가 호출 유도
-    try {
-      await page.mouse.wheel(0, 1400);
-      await page.waitForTimeout(1200);
-      await page.mouse.wheel(0, 1400);
-      await page.waitForTimeout(1200);
-    } catch {}
+    // ✅ 가격탭은 클릭/스크롤로 요청이 터지는 케이스가 많음
+    await triggerPriceRequests(page);
+
+    // ✅ 추가 대기(뒤늦게 호출되는 graphql 잡기)
+    await page.waitForTimeout(1500);
 
     const out = dedup(menus);
     debug.menusFound = out.length;
