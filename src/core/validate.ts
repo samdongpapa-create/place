@@ -16,7 +16,7 @@ const inputSchema = z.discriminatedUnion("mode", [
 export const analyzeRequestSchema = z.object({
   input: inputSchema,
   options: z.object({
-    industry: z.enum(["hair_salon", "cafe", "real_estate"]),
+    plan: z.enum(["free", "pro"]).default("free"),
     language: z.literal("ko").default("ko"),
     depth: z.enum(["standard", "deep"]).default("standard")
   })
