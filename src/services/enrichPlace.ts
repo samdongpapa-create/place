@@ -14,51 +14,55 @@ type PlaceProfileLike = {
   description?: string;
   directions?: string;
   tags?: string[];
-  keywords?: string[]; // ✅ 기존 대표키워드(원문 전체)
-  keywords5?: string[]; // ✅ 대표키워드 5개(유료 전환용)
+  keywords?: string[];
+  keywords5?: string[];
   menus?: Menu[];
   reviews?: any;
   photos?: { count?: number };
   _menuDebug?: any;
   _keywordDebug?: any;
+
+  // 혹시 이전 파이프라인에서 내려오면 제거 대상
+  scores?: any;
+  recommend?: any;
+  todoTop5?: any;
+  keyword?: any;
 };
 
 export async function enrichPlace(place: PlaceProfileLike): Promise<any> {
   const base = basePlaceUrl(place.placeUrl);
   const isHair = isHairSalon(place);
 
+  // ✅ 이전 단계에서 scores/recommend가 이미 들어왔어도 여기서 싹 제거 (중복 방지)
+  delete (place as any).scores;
+  delete (place as any).recommend;
+  delete (place as any).todoTop5;
+  delete (place as any).keyword;
+
   // =========================
-  // 0) ✅ 대표키워드(최우선)
-  //    A) frame source(keywordList) = 정답 루트
-  //    B) 실패 시 GraphQL/DOM 휴리스틱 폴백
+  // 0) 대표키워드(최우선)
   // =========================
   if (!place.keywords || place.keywords.length === 0) {
     const homeUrl = `${base}/home`;
 
-    // (A) frame source keywordList 파싱
     try {
       const kw = await fetchRepresentativeKeywords5ByFrameSource(homeUrl);
-
       if (kw?.raw?.length) {
         place.keywords = kw.raw.slice(0, 15);
         place.keywords5 = (kw.keywords5?.length ? kw.keywords5 : kw.raw.slice(0, 5)).slice(0, 5);
       }
-
       place._keywordDebug = { via: "frame-keywordList", ...(kw?.debug ?? {}) };
     } catch (e: any) {
       place._keywordDebug = { via: "frame-keywordList", error: e?.message ?? "keywordList parse failed" };
     }
 
-    // (B) 폴백: GraphQL/DOM heuristic
     if (!place.keywords || place.keywords.length === 0) {
       try {
         const kw2 = await fetchExistingKeywordsViaPlaywright(homeUrl);
-
         if (kw2?.keywords?.length) {
           place.keywords = kw2.keywords.slice(0, 15);
           place.keywords5 = kw2.keywords.slice(0, 5);
         }
-
         place._keywordDebug = {
           ...(place._keywordDebug || {}),
           fallback: { via: "graphql-dom-heuristic", ...(kw2?.debug ?? {}) }
@@ -71,21 +75,19 @@ export async function enrichPlace(place: PlaceProfileLike): Promise<any> {
       }
     }
   } else {
-    // 이미 keywords가 있으면 keywords5를 맞춰줌
     if (!place.keywords5 || place.keywords5.length === 0) {
       place.keywords5 = place.keywords.slice(0, 5);
     }
   }
 
   // =========================
-  // 1) ✅ 메뉴/가격: 미용실은 /price Playwright만 (안되면 배제)
+  // 1) 메뉴/가격: 미용실은 /price Playwright만
   // =========================
   if (isHair && (!place.menus || place.menus.length === 0)) {
     const priceUrl = `${base}/price`;
 
     try {
       const pw = await fetchMenusViaPlaywright(priceUrl);
-
       if (pw?.menus?.length) {
         place.menus = cleanMenus(pw.menus);
         place._menuDebug = { via: "hair-price-pw", isHair, ...(pw?.debug ?? {}) };
@@ -98,12 +100,14 @@ export async function enrichPlace(place: PlaceProfileLike): Promise<any> {
   }
 
   // =========================
-  // 2) ✅ 점수화 + 추천키워드 + TODO
+  // 2) 점수화는 scorePlace 1번만
   // =========================
   const audit = scorePlace(place);
 
-  // 최종 응답: place + scores/recommend/todoTop5
-  return { ...place, ...audit };
+  return {
+    ...place,
+    ...audit
+  };
 }
 
 function isHairSalon(place: PlaceProfileLike) {
@@ -160,4 +164,3 @@ function cleanMenus(menus: Menu[]): Menu[] {
 
   return out.slice(0, 30);
 }
-
