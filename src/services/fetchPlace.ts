@@ -1,4 +1,6 @@
 // src/services/fetchPlace.ts
+import { chromium } from "playwright";
+
 export type FetchedPage = { html: string; finalUrl: string };
 
 type FetchOptions = {
@@ -19,8 +21,6 @@ function buildHeaders(extra?: Record<string, string>) {
     "Cache-Control": "no-cache",
     Pragma: "no-cache",
     Referer: "https://m.place.naver.com/",
-    // ✅ 일부 환경에서 압축 관련 이슈/차단이 나서 identity도 옵션으로 제공(자동 처리되면 무시됨)
-    // "Accept-Encoding": "gzip, deflate, br",
     ...(extra || {})
   };
 }
@@ -36,60 +36,76 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
   }
 }
 
-/**
- * ✅ 네이버 플레이스 HTML이 "정상 페이지"인지 빠르게 판정
- * - __NEXT_DATA__가 있어야 (대표키워드/상세데이터) 안정적으로 추출 가능
- * - 차단/리뷰/빈껍데기 페이지면 false
- */
-function looksLikeValidPlaceHtml(html: string) {
-  if (!html || html.length < 800) return false;
-
-  // 차단/접근 제한 류
-  if (/접근이 제한|비정상적인 접근|captcha|자동입력|로봇|보안/i.test(html)) return false;
-
-  // Next.js 데이터가 없으면 대표키워드 추출이 매우 불안정(=DOM 잡음으로 흐름)
-  const hasNextData = /id="__NEXT_DATA__"/i.test(html) && /"props"\s*:\s*\{/i.test(html);
-  if (!hasNextData) return false;
-
-  // 플레이스 기본 단서(너무 빡세게 하지 말고)
-  const hasOg = /property="og:title"|property="og:description"|property="og:url"/i.test(html);
-  return hasOg || hasNextData;
+function normalizePlaceUrl(url: string) {
+  if (!url) return url;
+  let u = url.trim();
+  // /place/12345 -> /home
+  if (/\/place\/\d+\/?$/i.test(u)) u = u.replace(/\/?$/i, "/home");
+  return u;
 }
 
-/**
- * ✅ URL에 cache-bust 파라미터를 붙여서 (간헐적 캐시/빈껍데기) 방지
- */
 function withCacheBust(url: string, attempt: number) {
   try {
     const u = new URL(url);
-    // 기존 쿼리 유지 + cb 추가
     u.searchParams.set("cb", `${Date.now()}_${attempt}`);
     return u.toString();
   } catch {
-    // URL 파싱 실패하면 그냥 뒤에 붙임
     const sep = url.includes("?") ? "&" : "?";
     return `${url}${sep}cb=${Date.now()}_${attempt}`;
   }
 }
 
 /**
- * ✅ 대표키워드 파싱을 위해 "가능하면 home 페이지"로 유도
- * - /place/{id}/home → 그대로 OK
- * - /place/{id} → /home 붙이기
+ * ✅ 우리가 원하는 "파싱 가능한 플레이스 HTML" 판정:
+ * - __NEXT_DATA__가 있어야 대표키워드/상세데이터가 안정적
  */
-function normalizePlaceUrl(url: string) {
-  if (!url) return url;
+function looksLikeValidPlaceHtml(html: string) {
+  if (!html || html.length < 800) return false;
 
-  // trailing slash 정리
-  let u = url.trim();
+  // 차단/보안류
+  if (/접근이 제한|비정상적인 접근|captcha|자동입력|로봇|보안/i.test(html)) return false;
 
-  // /place/12345 (끝) → /place/12345/home
-  if (/\/place\/\d+\/?$/i.test(u)) u = u.replace(/\/?$/i, "/home");
+  // Next.js 데이터(핵심)
+  const hasNext = /id="__NEXT_DATA__"/i.test(html) && /"props"\s*:\s*\{/i.test(html);
+  if (!hasNext) return false;
 
-  // 기타: 너무 다양한 탭이 들어오면 home으로 맞춰도 됨(원하면 유지)
-  // u = u.replace(/\/(photo|review|menu|price|booking)(\?.*)?$/i, "/home");
+  return true;
+}
 
-  return u;
+/**
+ * ✅ fetch가 껍데기만 줄 때 -> Playwright로 실제 렌더링된 HTML을 받아온다.
+ * (이 HTML에는 __NEXT_DATA__가 들어오는 경우가 많고, 안 들어와도 DOM 기반 추출이 훨씬 낫다)
+ */
+async function fetchPlaceHtmlViaPlaywright(url: string, timeoutMs: number): Promise<FetchedPage> {
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox"]
+  });
+
+  try {
+    const context = await browser.newContext({
+      userAgent: UA_MOBILE,
+      locale: "ko-KR"
+    });
+
+    const page = await context.newPage();
+
+    // 네이버가 늦게 로드/리다이렉트 하는 케이스가 있어 domcontentloaded + 약간 대기
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: Math.max(10000, timeoutMs) }).catch(() => {});
+    // __NEXT_DATA__ 등장 기다리기(짧게)
+    await page.waitForTimeout(1200);
+    // 스크립트가 붙는 케이스가 있어서 한 번 더 대기
+    await page.waitForTimeout(1200);
+
+    const finalUrl = page.url();
+
+    // 렌더된 HTML
+    const html = await page.content();
+
+    return { html, finalUrl };
+  } finally {
+    await browser.close().catch(() => {});
+  }
 }
 
 export async function fetchPlaceHtml(placeUrl: string, opts: FetchOptions = {}): Promise<FetchedPage> {
@@ -101,25 +117,16 @@ export async function fetchPlaceHtml(placeUrl: string, opts: FetchOptions = {}):
 
   let lastErr: any = null;
 
-  // ✅ URL 정규화(대표키워드/데이터는 home이 안정적)
   const normalized = normalizePlaceUrl(placeUrl);
 
   for (let i = 0; i <= retries; i++) {
-    try {
-      // ✅ cache-bust로 빈껍데기/캐시 이슈 방지
-      const url = withCacheBust(normalized, i);
+    const url = withCacheBust(normalized, i);
 
-      // 1차 요청
+    // 1) 먼저 fetch 시도(가장 빠름)
+    try {
       const res = await fetchWithTimeout(
         url,
-        {
-          method: "GET",
-          headers: buildHeaders({
-            // ✅ 간헐적으로 서버가 모바일 페이지를 덜 주는 케이스 방지(있으면 도움)
-            "Upgrade-Insecure-Requests": "1"
-          }),
-          redirect: "follow"
-        },
+        { method: "GET", headers: buildHeaders({ "Upgrade-Insecure-Requests": "1" }), redirect: "follow" },
         timeoutMs
       );
 
@@ -129,34 +136,38 @@ export async function fetchPlaceHtml(placeUrl: string, opts: FetchOptions = {}):
       if (!res.ok) {
         throw new Error(`fetchPlaceHtml failed: ${res.status} ${res.statusText}\n${html.slice(0, 400)}`);
       }
-
-      // ✅ 길이 체크
       if (html.length < minLength) {
-        throw new Error(
-          `fetchPlaceHtml got too-small html (${html.length}). minLength=${minLength}\nfinalUrl=${finalUrl}`
-        );
+        throw new Error(`fetchPlaceHtml got too-small html (${html.length}). minLength=${minLength}\nfinalUrl=${finalUrl}`);
       }
 
-      // ✅ "정상 플레이스 HTML"인지 검사 (대표키워드용)
-      if (!looksLikeValidPlaceHtml(html)) {
-        // 한번 더 다른 헤더로 재시도할 수 있게 에러로 처리
-        throw new Error(
-          `fetchPlaceHtml got invalid/blocked html (no __NEXT_DATA__ or blocked)\nfinalUrl=${finalUrl}\nhead=${html
-            .slice(0, 300)
-            .replace(/\s+/g, " ")}`
-        );
+      // ✅ 정상 플레이스 HTML이면 바로 리턴
+      if (looksLikeValidPlaceHtml(html)) {
+        return { html, finalUrl };
       }
 
-      return { html, finalUrl };
+      // ❗여기 도달 = 네이버가 껍데기 HTML 준 것
+      throw new Error(
+        `fetchPlaceHtml got shell/blocked html (no __NEXT_DATA__)\nfinalUrl=${finalUrl}\nhead=${html
+          .slice(0, 300)
+          .replace(/\s+/g, " ")}`
+      );
     } catch (e: any) {
       lastErr = e;
+    }
 
-      // ✅ 마지막 시도면 종료
-      if (i === retries) break;
+    // 2) fetch 실패/껍데기면 -> Playwright 폴백(대표키워드 뽑기 위해 필수)
+    try {
+      const pw = await fetchPlaceHtmlViaPlaywright(url, timeoutMs);
 
-      // ✅ 다음 시도에서는 헤더를 약간 바꿔서(일부 환경에서 효과)
-      // (재시도 루프 자체는 동일 fetch로 충분하지만, 구조상 여기서는 그냥 continue)
-      continue;
+      if (!pw.html || pw.html.length < minLength) {
+        throw new Error(`playwright html too small (${pw.html?.length ?? 0}) finalUrl=${pw.finalUrl}`);
+      }
+
+      // Playwright로 받은 HTML은 대부분 __NEXT_DATA__가 생기거나, 최소한 DOM 칩 추출이 가능
+      return pw;
+    } catch (e: any) {
+      lastErr = e;
+      // 재시도 루프로 계속
     }
   }
 
