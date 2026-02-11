@@ -17,7 +17,6 @@ type PlaceProfileLike = {
   placeId?: string;
   placeUrl: string;
 
-  // 기본필드
   name?: string;
   category?: string;
   address?: string;
@@ -25,28 +24,23 @@ type PlaceProfileLike = {
   description?: string;
   directions?: string;
 
-  // 키워드
   keywords?: string[];
   keywords5?: string[];
 
-  // 메뉴
   menus?: Menu[];
 
-  // 사진
   photoCount?: number;
   photos?: { count?: number };
 
-  // 경쟁사
   competitors?: Competitor[];
 
-  // 점수/리포트
   audit?: any;
 
-  // 디버그
   _basicDebug?: any;
   _keywordDebug?: any;
   _menuDebug?: any;
   _competitorDebug?: any;
+  _scoreDebug?: any;
 
   [k: string]: any;
 };
@@ -55,10 +49,7 @@ export async function enrichPlace(place: PlaceProfileLike): Promise<PlaceProfile
   const base = basePlaceUrl(place.placeUrl);
   const homeUrl = `${base}/home`;
 
-  // =========================================================
-  // 1) ✅ 기본필드(이름/카테고리/주소/오시는길/상세설명/사진수)
-  // - 상세설명은 여기서 “진짜 소개”를 최대한 안정적으로 잡는다
-  // =========================================================
+  // 1) BASIC FIELDS
   try {
     const b = await fetchBasicFieldsViaPlaywright(homeUrl, { timeoutMs: 12000, photo: true, debug: true });
 
@@ -66,28 +57,18 @@ export async function enrichPlace(place: PlaceProfileLike): Promise<PlaceProfile
     place.category = place.category || b.fields.category;
     place.address = normalizeAddr(place.address || b.fields.address);
     place.roadAddress = place.roadAddress || b.fields.roadAddress;
-
-    // ✅ 진짜 상세설명
     place.description = place.description || b.fields.description;
-
-    // ✅ 오시는길(너무 길거나 UI 찌꺼기 섞이면 정리)
     place.directions = cleanDirections(place.directions || b.fields.directions);
 
-    // ✅ 사진수
     if (typeof b.fields.photoCount === "number") place.photoCount = b.fields.photoCount;
 
     place._basicDebug = b.debug;
   } catch (e: any) {
-    place._basicDebug = { used: true, error: e?.message ?? "basic fields failed", targetUrl: homeUrl };
+    place._basicDebug = { used: true, targetUrl: homeUrl, error: e?.message ?? "basic fields failed" };
   }
 
-  // =========================================================
-  // 2) ✅ 대표키워드(최우선)
-  //    1) frame source keywordList (정답)
-  //    2) 실패 시 GraphQL/DOM 휴리스틱 폴백
-  // =========================================================
+  // 2) KEYWORDS5 (대표키워드)
   if (!place.keywords || place.keywords.length === 0) {
-    // (A) frame keywordList
     try {
       const kw = await fetchRepresentativeKeywords5ByFrameSource(homeUrl);
       if (kw.raw?.length) {
@@ -99,7 +80,6 @@ export async function enrichPlace(place: PlaceProfileLike): Promise<PlaceProfile
       place._keywordDebug = { via: "frame-keywordList", used: true, error: e?.message ?? "keywordList parse failed" };
     }
 
-    // (B) fallback
     if (!place.keywords || place.keywords.length === 0) {
       try {
         const kw2 = await fetchExistingKeywordsViaPlaywright(homeUrl);
@@ -116,9 +96,7 @@ export async function enrichPlace(place: PlaceProfileLike): Promise<PlaceProfile
     place.keywords5 = place.keywords.slice(0, 5);
   }
 
-  // =========================================================
-  // 3) ✅ 메뉴/가격(미용실은 /price Playwright)
-  // =========================================================
+  // 3) MENUS
   const isHair = isHairSalon(place);
   if (isHair && (!place.menus || place.menus.length === 0)) {
     const priceUrl = `${base}/price`;
@@ -126,19 +104,15 @@ export async function enrichPlace(place: PlaceProfileLike): Promise<PlaceProfile
       const pw = await fetchMenusViaPlaywright(priceUrl);
       if (pw.menus.length) {
         place.menus = cleanMenus(pw.menus);
-        place._menuDebug = { via: "hair-price-pw", used: true, targetUrl: priceUrl, ...pw.debug };
-      } else {
-        place._menuDebug = { via: "hair-price-pw", used: true, targetUrl: priceUrl, ...pw.debug, note: "no menus" };
       }
+      // ✅ 중복키 방지: pw.debug를 pwDebug로 감싸기
+      place._menuDebug = { used: true, targetUrl: priceUrl, via: "hair-price-pw", pwDebug: pw.debug };
     } catch (e: any) {
-      place._menuDebug = { via: "hair-price-pw", used: true, targetUrl: priceUrl, error: e?.message ?? "price pw failed" };
+      place._menuDebug = { used: true, targetUrl: priceUrl, via: "hair-price-pw", error: e?.message ?? "price pw failed" };
     }
   }
 
-  // =========================================================
-  // 4) ✅ 경쟁사 Top5 키워드(대표키워드 5개) 추출
-  // - m.place 검색이 막히는 경우가 많아서 m.search fallback을 기본 포함
-  // =========================================================
+  // 4) COMPETITORS
   if (!Array.isArray(place.competitors) || place.competitors.length === 0) {
     try {
       const query = buildCompetitorQuery(place);
@@ -151,12 +125,7 @@ export async function enrichPlace(place: PlaceProfileLike): Promise<PlaceProfile
     }
   }
 
-  // =========================================================
-  // 5) ✅ 점수/리포트(항상 생성)
-  // - free/pro를 “분리하지 않고”
-  // - pro 컨텐츠는 _proRaw에 항상 생성
-  // - pro.blocks는 locked 블랭크로 유지(결제 후 서버에서 풀기)
-  // =========================================================
+  // 5) SCORE/AUDIT (항상 생성 -> pro는 locked 블랭크)
   try {
     const r = scorePlace(place);
     place.audit = r.audit;
@@ -187,24 +156,20 @@ async function fetchCompetitorsTop5(
   const page = await ctx.newPage();
 
   try {
-    // 1) m.place search (종종 403/빈 html)
     const placeSearchUrl = `https://m.place.naver.com/search?query=${encodeURIComponent(query)}`;
     const t0 = Date.now();
     let html = "";
-    let ok = false;
 
     try {
-      const res = await page.goto(placeSearchUrl, { waitUntil: "domcontentloaded", timeout: timeoutMs });
+      await page.goto(placeSearchUrl, { waitUntil: "domcontentloaded", timeout: timeoutMs });
       await page.waitForTimeout(800);
       html = await page.content();
-      ok = !!res?.ok();
-      debug.steps.push({ step: "m.place.search", url: placeSearchUrl, ok, htmlLen: html.length, elapsedMs: Date.now() - t0 });
+      debug.steps.push({ step: "m.place.search", url: placeSearchUrl, ok: true, htmlLen: html.length, elapsedMs: Date.now() - t0 });
     } catch (e: any) {
       debug.steps.push({ step: "m.place.search", url: placeSearchUrl, ok: false, error: e?.message ?? "goto failed", elapsedMs: Date.now() - t0 });
       html = "";
     }
 
-    // 2) fallback: m.search
     if (!html || html.length < 5000) {
       const t1 = Date.now();
       const fallbackUrl = `https://m.search.naver.com/search.naver?query=${encodeURIComponent(query)}&where=m`;
@@ -214,13 +179,10 @@ async function fetchCompetitorsTop5(
       debug.steps.push({ step: "fallback.m.search", url: fallbackUrl, ok: true, htmlLen: html.length, elapsedMs: Date.now() - t1 });
     }
 
-    // html에서 placeId 후보 수집
     const ids = collectPlaceIdsFromHtml(html);
     const dedup = Array.from(new Set(ids)).filter((id) => id && id !== opts.excludePlaceId).slice(0, limit);
-
     debug.foundCandidates = dedup.length;
 
-    // 각 competitor의 대표키워드5 뽑기
     const competitors: Competitor[] = [];
     for (const id of dedup) {
       const url = `https://m.place.naver.com/place/${id}/home`;
@@ -249,15 +211,12 @@ function collectPlaceIdsFromHtml(html: string) {
   const out: string[] = [];
   const re = /m\.place\.naver\.com\/(?:hairshop|place)\/([0-9]{5,})/g;
   let m: RegExpExecArray | null;
-  while ((m = re.exec(html))) {
-    if (m[1]) out.push(m[1]);
-  }
+  while ((m = re.exec(html))) if (m[1]) out.push(m[1]);
   return out;
 }
 
 function buildCompetitorQuery(place: PlaceProfileLike) {
-  // 우선 역/지역+업종을 쓰고, 없으면 이름+업종
-  const base = `${place.name || ""} ${place.address || ""}`;
+  const base = `${place.name || ""} ${place.address || ""} ${place.roadAddress || ""}`;
   const geo = pickFirstMatch(base, [/서대문역/, /광화문/, /종로구/, /마포구/, /충정로/, /시청/]) || "해당 지역";
   const 업종 = isHairSalon(place) ? "미용실" : "가게";
   return `${geo} ${업종}`;
@@ -286,16 +245,13 @@ function basePlaceUrl(url: string) {
 function normalizeAddr(addr?: string) {
   const t = (addr || "").trim();
   if (!t) return undefined;
-  // "주소서울 ..." 같이 붙어오면 제거
   return t.replace(/^주소\s*/g, "").trim();
 }
 
 function cleanDirections(dir?: string) {
   const t = (dir || "").trim();
   if (!t) return undefined;
-  // 플레이스 UI 텍스트가 섞이면 길이 제한 + “내용 더보기” 제거
   const cleaned = t.replace(/\.\.\.\s*내용\s*더보기/g, "").trim();
-  // 너무 길면 앞부분만
   if (cleaned.length > 500) return cleaned.slice(0, 500).trim();
   return cleaned;
 }
