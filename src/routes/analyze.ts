@@ -13,6 +13,9 @@ import { scorePlace } from "../services/score.js";
 import { recommendForPlace } from "../services/recommend.js";
 import { applyPlanToRecommend } from "../services/applyPlan.js";
 
+// ✅ 추가: Playwright
+import { chromium } from "playwright";
+
 export const analyzeRouter = Router();
 
 const hasNext = (html: string) => /id="__NEXT_DATA__"/i.test(html);
@@ -29,12 +32,15 @@ analyzeRouter.post("/analyze", async (req, res) => {
   const { input, options } = parsed.data;
   const requestId = `req_${Date.now().toString(36)}`;
 
-  // ✅ 디버그: home/price에서 실제로 데이터가 오는지 즉시 판정
   const debug: any = {
     resolved: {},
     home: {},
-    priceProbe: {}
+    priceProbe: {},
+    playwright: {}
   };
+
+  let browser: any = null;
+  let page: any = null;
 
   try {
     const resolved = await resolvePlace(input as any, options as any);
@@ -44,7 +50,7 @@ analyzeRouter.post("/analyze", async (req, res) => {
       placeId: resolved.placeId ?? null
     };
 
-    // ✅ home은 shell일 수 있으니 minLength 낮추고(죽지 않게) debug 켜기
+    // ✅ home fetch (HTML 기반 파싱은 유지)
     const fetchedHome = await fetchPlaceHtml(resolved.placeUrl, {
       minLength: 120,
       retries: 1,
@@ -61,8 +67,7 @@ analyzeRouter.post("/analyze", async (req, res) => {
     const rawPlace = parsePlaceFromHtml(fetchedHome.html, fetchedHome.finalUrl);
     let place = normalizePlace({ ...rawPlace, placeUrl: fetchedHome.finalUrl }) as any;
 
-    // ✅ price 탭 probe (실패해도 절대 throw 안 남)
-    // enrichPlace 안에서도 시도하지만, 여기서 한 번 더 “확정 판정용”으로 찍어둠
+    // ✅ price probe (유지)
     try {
       const placeId = place?.placeId || resolved.placeId;
       const priceUrl = placeId
@@ -86,9 +91,51 @@ analyzeRouter.post("/analyze", async (req, res) => {
       debug.priceProbe = { error: e?.message ?? String(e) };
     }
 
-    // ✅ enrich (photo/price/menu/booking 순회)
-    place = (await enrichPlace(place)) as any;
+    // =====================================================
+    // ✅ 핵심: Playwright page를 만들어 enrichPlace에 주입
+    // =====================================================
+    const t0 = Date.now();
 
+    browser = await chromium.launch({
+      headless: true,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu"
+      ]
+    });
+
+    const context = await browser.newContext({
+      viewport: { width: 390, height: 844 }, // 모바일 느낌
+      locale: "ko-KR",
+      userAgent:
+        "Mozilla/5.0 (Linux; Android 13; SM-G991N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36"
+    });
+
+    // ✅ 속도/안정성: 이미지/폰트 같은 무거운 리소스 차단(필요시 해제 가능)
+    await context.route("**/*", (route) => {
+      const rt = route.request().resourceType();
+      if (rt === "image" || rt === "font" || rt === "media") return route.abort();
+      return route.continue();
+    });
+
+    page = await context.newPage();
+
+    debug.playwright = {
+      used: true,
+      headless: true
+    };
+
+    // ✅ enrich: 이제 ctx.page가 살아있어서
+    // 상세설명/오시는길/메뉴/경쟁사/사진/리뷰 파싱이 실제로 돈다
+    place = (await enrichPlace(place, { page })) as any;
+
+    debug.playwright.elapsedMs = Date.now() - t0;
+
+    // =====================================================
+    // score + recommend
+    // =====================================================
     const industry = autoClassifyIndustry(place);
     const scores = scorePlace(place, industry.vertical);
     const recommendRaw = recommendForPlace(place, scores, industry.subcategory);
@@ -103,7 +150,7 @@ analyzeRouter.post("/analyze", async (req, res) => {
         resolvedFrom: resolved.placeUrl,
         resolvedConfidence: resolved.confidence ?? null,
         fetchedAt: new Date().toISOString(),
-        debug // ✅ 여기!
+        debug
       },
       industry,
       place,
@@ -117,5 +164,13 @@ analyzeRouter.post("/analyze", async (req, res) => {
       message: e?.message ?? "unknown error",
       debug
     });
+  } finally {
+    // ✅ 누수 방지: 반드시 종료
+    try {
+      if (page) await page.close();
+    } catch {}
+    try {
+      if (browser) await browser.close();
+    } catch {}
   }
 });
