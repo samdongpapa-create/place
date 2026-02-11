@@ -1,264 +1,257 @@
-// src/services/playwrightBasicFields.ts
-import type { Page } from "playwright";
+// src/services/enrichPlace.ts
+import { fetchMenusViaPlaywright, type Menu } from "./playwrightMenus.js";
+import { fetchExistingKeywordsViaPlaywright } from "./playwrightKeywords.js";
+import { fetchRepresentativeKeywords5ByFrameSource } from "./playwrightKeywordList.js";
+import { scorePlace } from "./scorePlace.js";
+import { fetchBasicFieldsViaPlaywright } from "./playwrightBasicFields.js";
 
-export type BasicFields = {
+// ✅ 실제 export에 맞춤 (TS2724 해결)
+import { fetchCompetitorsTop } from "./playwrightCompetitors.js";
+
+type Competitor = {
+  placeId: string;
+  placeUrl: string;
+  keywords5?: string[];
+  debug?: any;
+};
+
+type PlaceProfileLike = {
+  placeId?: string;
+  placeUrl: string;
+
   name?: string;
   category?: string;
   address?: string;
   roadAddress?: string;
-  // ✅ 네가 말하는 "오시는길"
-  directions?: string;
-  // ✅ 네가 말하는 "상세설명(소개글)"
-  description?: string;
-  photoCount?: number;
+  description?: string; // 상세설명(소개)
+  directions?: string;  // 오시는길
+
+  tags?: string[];
+  keywords?: string[];   // 기존 대표키워드(원문 전체)
+  keywords5?: string[];  // 대표키워드 5개
+
+  menus?: Menu[];
+  photos?: { count?: number };
+  competitors?: Competitor[];
+
+  // 디버그
+  _basicDebug?: any;
+  _menuDebug?: any;
+  _keywordDebug?: any;
+  _competitorDebug?: any;
+  _scoreDebug?: any;
+
+  // 확장 필드
+  [k: string]: any;
 };
 
-export type BasicFieldsResult = {
-  fields: BasicFields;
-  debug: any;
-};
+// ✅ ctx를 optional 처리해서 analyze.ts에서 1개 인자로 호출해도 컴파일 통과 (TS2554 방어)
+export async function enrichPlace(
+  place: PlaceProfileLike,
+  ctx?: { page: any }
+): Promise<PlaceProfileLike> {
+  const base = basePlaceUrl(place.placeUrl);
+  const isHair = isHairSalon(place);
 
-type Opts = {
-  timeoutMs?: number;
-};
+  const page = ctx?.page;
 
-export async function fetchBasicFieldsViaPlaywright(
-  page: Page,
-  homeUrl: string,
-  opts: Opts = {}
-): Promise<BasicFieldsResult> {
-  const t0 = Date.now();
-  const timeoutMs = opts.timeoutMs ?? 15000;
-
-  const debug: any = {
-    used: true,
-    targetUrl: stripQuery(homeUrl),
-    steps: [],
-    picked: {},
-  };
-
-  const fields: BasicFields = {};
-
-  // 1) HOME 진입
-  await page.goto(homeUrl, { waitUntil: "domcontentloaded", timeout: timeoutMs });
-  debug.steps.push({ step: "goto.home", elapsedMs: Date.now() - t0 });
-
-  // 약간 기다려야 NEXT_DATA/렌더가 안정화됨
-  await page.waitForTimeout(600);
-
-  // 2) DOM + meta + nextdata 후보를 한 번에 수집
-  const raw = await page.evaluate(() => {
-    const d = (globalThis as any).document;
-
-    const text = (sel: string) => {
-      const el = d?.querySelector?.(sel);
-      return (el?.textContent ?? "").trim();
-    };
-
-    const attr = (sel: string, name: string) => {
-      const el = d?.querySelector?.(sel);
-      return (el?.getAttribute?.(name) ?? "").trim();
-    };
-
-    // meta
-    const ogDesc = attr('meta[property="og:description"]', "content") || "";
-    const metaDesc = attr('meta[name="description"]', "content") || "";
-
-    // NEXT_DATA (있으면 제일 강력)
-    let nextJsonText = "";
+  // =========================================================
+  // 0) 기본필드(이름/주소/오시는길/상세설명) - Playwright 필요
+  // =========================================================
+  if (page) {
     try {
-      nextJsonText = text("#__NEXT_DATA__");
-    } catch {}
+      const homeUrl = `${base}/home`;
+      const bf = await fetchBasicFieldsViaPlaywright(page, homeUrl, { timeoutMs: 15000 });
 
-    // 페이지 텍스트 스냅샷(최후의 후보 탐색용)
-    let bodyText = "";
-    try {
-      bodyText = (d?.body?.innerText ?? "").slice(0, 6000);
-    } catch {}
+      place.name = place.name || bf.fields.name;
+      place.category = place.category || bf.fields.category;
+      place.address = place.address || bf.fields.address;
+      place.roadAddress = place.roadAddress || bf.fields.roadAddress;
+      place.directions = place.directions || bf.fields.directions;
 
-    // 이름/카테고리/주소/오시는길은 DOM에서 최대한 직접
-    // (Naver DOM이 자주 바뀌어서 "후보" 여러개로 둠)
-    const nameCandidates = [
-      text("h1"),
-      text('[data-testid="title"]'),
-      text(".Fc1rA"), // (가끔 쓰이는 클래스)
-    ].filter(Boolean);
+      // 상세설명은 meta 스니펫일 수 있어 빈값 처리 규칙은 playwrightBasicFields에서 처리
+      place.description = place.description || bf.fields.description;
 
-    const categoryCandidates = [
-      text('[class*="category"]'),
-      text(".place_bluelink + span"),
-    ].filter(Boolean);
-
-    // 주소 후보: "주소" 텍스트 포함 블록 우선
-    const addrCandidates = [
-      text('div:has(span:has-text("주소"))'),
-      text('section:has(span:has-text("주소"))'),
-      text('[class*="address"]'),
-    ].filter(Boolean);
-
-    // "찾아가는길" 영역 후보
-    const dirCandidates = [
-      text('div:has-text("찾아가는길")'),
-      text('section:has-text("찾아가는길")'),
-      text('[class*="direction"]'),
-    ].filter(Boolean);
-
-    return {
-      nameCandidates,
-      categoryCandidates,
-      addrCandidates,
-      dirCandidates,
-      ogDesc,
-      metaDesc,
-      nextJsonText,
-      bodyText,
-    };
-  });
-
-  // 3) name/category/address/directions 정리
-  fields.name = pickFirstMeaningful(raw.nameCandidates);
-  fields.category = pickFirstMeaningful(raw.categoryCandidates);
-
-  // 주소는 "지도내비게이션거리뷰" 같은 붙은 쓰레기 텍스트가 섞이므로 정리
-  fields.address = cleanAddress(pickFirstMeaningful(raw.addrCandidates) || "");
-
-  // 오시는길: "찾아가는길" 헤더 같은 줄 제거 + 내용만 정리
-  fields.directions = cleanDirections(pickFirstMeaningful(raw.dirCandidates) || "");
-
-  // 4) ✅ 상세설명(소개글) — 후보 우선순위:
-  // (A) NEXT_DATA에서 description/intro 후보 탐색
-  // (B) meta/og description
-  // (C) bodyText에서 "소개" 근처 스니펫(최후)
-  const fromNext = extractIntroFromNextData(raw.nextJsonText);
-  const fromMeta = cleanDescription(raw.ogDesc || raw.metaDesc || "");
-  const fromBody = extractIntroFromBodyText(raw.bodyText);
-
-  const desc = pickFirstMeaningful([fromNext, fromMeta, fromBody].filter(Boolean));
-  fields.description = cleanDescription(desc || "");
-
-  // “리뷰 숫자 요약”만 잡힌 경우는 상세설명 없음 처리
-  if (looksLikeReviewSnippet(fields.description || "")) {
-    fields.description = "";
+      place._basicDebug = Object.assign({}, { used: true, targetUrl: homeUrl }, bf.debug);
+    } catch (e: any) {
+      place._basicDebug = { used: true, error: e?.message ?? "basicFields failed" };
+    }
+  } else {
+    place._basicDebug = { used: false, reason: "ctx.page missing (skipped Playwright basicFields)" };
   }
 
-  debug.picked = {
-    name: !!fields.name,
-    category: !!fields.category,
-    address: !!fields.address,
-    directions: !!fields.directions,
-    description: !!fields.description,
-    descriptionSource: fromNext ? "nextData" : fromMeta ? "meta" : fromBody ? "body" : "none",
-  };
+  // =========================================================
+  // 1) 대표키워드(최우선) - frame source keywordList -> fallback
+  // =========================================================
+  if (!place.keywords || place.keywords.length === 0) {
+    const homeUrl = `${base}/home`;
 
-  debug.elapsedMs = Date.now() - t0;
-  debug.raw = {
-    ogDesc: raw.ogDesc,
-    metaDesc: raw.metaDesc,
-    hasNextData: !!raw.nextJsonText,
-  };
+    // (A) frame source keywordList (page 없어도 가능하게 만들어둔 경우가 많아서 그대로 시도)
+    try {
+      const kw = await fetchRepresentativeKeywords5ByFrameSource(homeUrl);
 
-  return { fields, debug };
+      if (kw.raw?.length) {
+        place.keywords = kw.raw.slice(0, 15);
+        place.keywords5 = kw.keywords5?.length ? kw.keywords5.slice(0, 5) : kw.raw.slice(0, 5);
+      }
+
+      place._keywordDebug = Object.assign({}, { used: true, targetUrl: homeUrl, via: "frame-keywordList" }, kw.debug);
+    } catch (e: any) {
+      place._keywordDebug = { used: true, targetUrl: homeUrl, via: "frame-keywordList", error: e?.message ?? "keywordList parse failed" };
+    }
+
+    // (B) fallback (Playwright 필요)
+    if ((!place.keywords || place.keywords.length === 0) && page) {
+      try {
+        const kw2 = await fetchExistingKeywordsViaPlaywright(homeUrl);
+        if (kw2.keywords?.length) {
+          place.keywords = kw2.keywords.slice(0, 15);
+          place.keywords5 = kw2.keywords.slice(0, 5);
+        }
+        place._keywordDebug = Object.assign({}, place._keywordDebug || {}, {
+          fallback: Object.assign({}, { used: true, targetUrl: homeUrl, via: "graphql-dom-heuristic" }, kw2.debug),
+        });
+      } catch (e: any) {
+        place._keywordDebug = Object.assign({}, place._keywordDebug || {}, {
+          fallback: { used: true, targetUrl: homeUrl, via: "graphql-dom-heuristic", error: e?.message ?? "keyword pw failed" },
+        });
+      }
+    } else if (!page) {
+      place._keywordDebug = Object.assign({}, place._keywordDebug || {}, {
+        fallback: { used: false, reason: "ctx.page missing (skipped Playwright keyword fallback)" },
+      });
+    }
+  } else {
+    if (!place.keywords5 || place.keywords5.length === 0) place.keywords5 = place.keywords.slice(0, 5);
+  }
+
+  // =========================================================
+  // 2) 메뉴/가격: 미용실은 /price Playwright만
+  // =========================================================
+  if (isHair && (!place.menus || place.menus.length === 0)) {
+    const priceUrl = `${base}/price`;
+
+    if (page) {
+      try {
+        const pw = await fetchMenusViaPlaywright(priceUrl);
+
+        if (pw.menus.length) {
+          place.menus = cleanMenus(pw.menus);
+        }
+
+        place._menuDebug = Object.assign({}, { used: true, targetUrl: priceUrl, via: "hair-price-pw" }, pw.debug);
+      } catch (e: any) {
+        place._menuDebug = { used: true, targetUrl: priceUrl, via: "hair-price-pw", error: e?.message ?? "price pw failed" };
+      }
+    } else {
+      place._menuDebug = { used: false, targetUrl: priceUrl, reason: "ctx.page missing (skipped Playwright menus)" };
+    }
+  }
+
+  // =========================================================
+  // 3) 경쟁사 Top5 (키워드 5개씩) - Playwright 필요
+  // =========================================================
+  if (page) {
+    try {
+      const query = buildCompetitorQuery(place);
+
+      // ✅ 기존 코드가 fetchCompetitorsTop5를 쓰고 있었으니,
+      //    여기서 호환 래퍼로 해결 (import/export 불일치 TS2724 방어)
+      const res = await fetchCompetitorsTop5(page, { query, limit: 5, excludePlaceId: place.placeId });
+
+      place.competitors = res.competitors || [];
+      place._competitorDebug = res.debug || { used: true, query, limit: 5 };
+    } catch (e: any) {
+      place._competitorDebug = { used: true, error: e?.message ?? "competitors failed" };
+    }
+  } else {
+    place._competitorDebug = { used: false, reason: "ctx.page missing (skipped Playwright competitors)" };
+  }
+
+  // =========================================================
+  // 4) 점수/리포트 생성
+  // =========================================================
+  try {
+    Object.assign(place, scorePlace(place));
+  } catch (e: any) {
+    place._scoreDebug = { used: true, error: e?.message ?? "scorePlace failed" };
+  }
+
+  return place;
+}
+
+/* ---------------- compat wrapper ---------------- */
+
+// ✅ fetchCompetitorsTop만 있는 프로젝트에서도 기존 코드 형태(fetchCompetitorsTop5) 유지 가능
+async function fetchCompetitorsTop5(
+  page: any,
+  opts: { query: string; limit?: number; excludePlaceId?: string }
+): Promise<{ competitors?: Competitor[]; debug?: any }> {
+  // fetchCompetitorsTop의 시그니처가 (page, opts) 형태라고 가정(너 에러 메시지가 이 구조를 강하게 시사)
+  // 만약 내부 시그니처가 다르면 여기만 고치면 전체가 살아남.
+  return fetchCompetitorsTop(page, { ...opts, limit: opts.limit ?? 5 });
 }
 
 /* ---------------- helpers ---------------- */
 
-function stripQuery(url: string) {
-  return url.replace(/\?.*$/, "");
+function isHairSalon(place: PlaceProfileLike) {
+  const c = (place.category || "").toLowerCase();
+  const n = (place.name || "").toLowerCase();
+  return c.includes("미용실") || n.includes("헤어") || n.includes("hair");
 }
 
-function pickFirstMeaningful(arr: string[]) {
-  for (const s of arr || []) {
-    const x = (s || "").trim();
-    if (!x) continue;
-    if (x.length < 2) continue;
-    return x;
-  }
-  return "";
+function basePlaceUrl(url: string) {
+  return url.replace(/\/(home|photo|review|price|menu|booking)(\?.*)?$/i, "");
 }
 
-function cleanAddress(s: string) {
-  let x = (s || "").trim();
-  if (!x) return "";
-  x = x
-    .replace(/지도내비게이션거리뷰/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-
-  // "서대문역 4번 출구에서 90m" 같은 안내문이 붙는 경우 잘라내기
-  x = x.replace(/서대문역.*?m\s*미터.*$/i, "").trim();
-  return x;
+function buildCompetitorQuery(place: PlaceProfileLike) {
+  const addr = (place.address || "").toString();
+  if (addr.includes("서대문역")) return "서대문역 미용실";
+  if (addr.includes("종로구")) return "종로구 미용실";
+  return `${place.name || ""} 미용실`.trim() || "미용실";
 }
 
-function cleanDirections(s: string) {
-  let x = (s || "").trim();
-  if (!x) return "";
-  x = x.replace(/^찾아가는길\s*/g, "").trim();
-  x = x.replace(/\s*\.\.\.\s*내용 더보기\s*$/g, "").trim();
-  x = x.replace(/\s+/g, " ").trim();
-  return x;
+function looksLikeParkingFee(name: string) {
+  const x = name.toLowerCase();
+  return (
+    x.includes("주차") ||
+    x.includes("분당") ||
+    x.includes("초과") ||
+    x.includes("최초") ||
+    x.includes("시간") ||
+    x.includes("요금") ||
+    /^[0-9]+$/.test(name.trim())
+  );
 }
 
-function cleanDescription(s: string) {
-  let x = (s || "").trim();
-  if (!x) return "";
-  x = x.replace(/\s+/g, " ").trim();
-  return x;
-}
+function cleanMenus(menus: Menu[]): Menu[] {
+  const out: Menu[] = [];
+  const seen = new Set<string>();
 
-function looksLikeReviewSnippet(s: string) {
-  const x = (s || "").trim();
-  if (!x) return false;
-  // 네 로그처럼 “방문자리뷰/블로그리뷰” 스니펫은 상세설명 아님
-  return /방문자리뷰|블로그리뷰/.test(x) && x.length < 80;
-}
+  for (const it of menus || []) {
+    const name = (it?.name || "").trim();
+    const price = typeof it?.price === "number" ? it.price : undefined;
 
-function extractIntroFromNextData(nextJsonText: string) {
-  const t = (nextJsonText || "").trim();
-  if (!t) return "";
+    if (!name) continue;
+    if (!/[가-힣A-Za-z]/.test(name)) continue;
+    if (looksLikeParkingFee(name)) continue;
 
-  try {
-    const json = JSON.parse(t);
-
-    // 구조가 자주 바뀌어서 "문자열 탐색" 위주로 안전하게
-    const candidates: string[] = [];
-    const s = JSON.stringify(json);
-
-    // 흔한 키들: description, intro, introduction, summary 등
-    // 너무 길면 잘라냄
-    for (const key of ["description", "intro", "introduction", "summary", "storeDescription"]) {
-      const m = s.match(new RegExp(`"${key}"\\s*:\\s*"([^"]{10,600})"`));
-      if (m?.[1]) candidates.push(unescapeJsonString(m[1]));
+    if (typeof price === "number") {
+      if (price < 5000) continue;
+      if (price > 2000000) continue;
     }
 
-    return pickFirstMeaningful(candidates);
-  } catch {
-    return "";
+    const key = `${name}:${price ?? "na"}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    out.push({
+      name,
+      ...(typeof price === "number" ? { price } : {}),
+      ...(typeof it.durationMin === "number" ? { durationMin: it.durationMin } : {}),
+      ...(it.note ? { note: it.note } : {}),
+    });
   }
-}
 
-function unescapeJsonString(s: string) {
-  // JSON 문자열 escape 최소 복원
-  return (s || "")
-    .replace(/\\"/g, '"')
-    .replace(/\\n/g, "\n")
-    .replace(/\\t/g, "\t")
-    .replace(/\\u003c/g, "<")
-    .replace(/\\u003e/g, ">")
-    .replace(/\\u0026/g, "&")
-    .trim();
-}
-
-function extractIntroFromBodyText(bodyText: string) {
-  const t = (bodyText || "").trim();
-  if (!t) return "";
-
-  // “소개”라는 단어 주변에서 1~2줄 뽑기 (최후의 수단)
-  const idx = t.indexOf("소개");
-  if (idx === -1) return "";
-
-  const slice = t.slice(idx, idx + 280);
-  // 너무 잡다한 메뉴 네비 텍스트 섞이면 컷
-  if (slice.includes("리뷰") && slice.includes("사진") && slice.length < 60) return "";
-
-  return slice;
+  return out.slice(0, 30);
 }
