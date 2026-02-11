@@ -57,7 +57,7 @@ export async function enrichPlace(place: PlaceProfileLike, ctx?: { page: any }):
   if (page) {
     try {
       const homeUrl = `${base}/home`;
-      const bf = await fetchBasicFieldsViaPlaywright(page, homeUrl, { timeoutMs: 15000 });
+      const bf = await fetchBasicFieldsViaPlaywright(page as any, homeUrl, { timeoutMs: 15000 });
 
       if (empty(place.name)) place.name = bf.fields.name;
       if (empty(place.category)) place.category = bf.fields.category;
@@ -78,17 +78,19 @@ export async function enrichPlace(place: PlaceProfileLike, ctx?: { page: any }):
   }
 
   // =========================================================
-  // 1) 대표키워드
+  // 1) 대표키워드(현재 플레이스)
   // =========================================================
   if (!place.keywords || place.keywords.length === 0) {
     const homeUrl = `${base}/home`;
 
     try {
       const kw = await fetchRepresentativeKeywords5ByFrameSource(homeUrl);
+
       if (kw.raw?.length) {
         place.keywords = kw.raw.slice(0, 15);
         place.keywords5 = kw.keywords5?.length ? kw.keywords5.slice(0, 5) : kw.raw.slice(0, 5);
       }
+
       place._keywordDebug = Object.assign({}, { used: true, targetUrl: homeUrl, via: "frame-keywordList" }, kw.debug);
     } catch (e: any) {
       place._keywordDebug = { used: true, targetUrl: homeUrl, via: "frame-keywordList", error: e?.message ?? "keywordList parse failed" };
@@ -109,10 +111,6 @@ export async function enrichPlace(place: PlaceProfileLike, ctx?: { page: any }):
           fallback: { used: true, targetUrl: homeUrl, via: "graphql-dom-heuristic", error: e?.message ?? "keyword pw failed" },
         });
       }
-    } else if (!page) {
-      place._keywordDebug = Object.assign({}, place._keywordDebug || {}, {
-        fallback: { used: false, reason: "ctx.page missing (skipped Playwright keyword fallback)" },
-      });
     }
   } else {
     if (!place.keywords5 || place.keywords5.length === 0) place.keywords5 = place.keywords.slice(0, 5);
@@ -138,19 +136,58 @@ export async function enrichPlace(place: PlaceProfileLike, ctx?: { page: any }):
   }
 
   // =========================================================
-  // 3) ✅ 유료 핵심: 경쟁사 Top5 (이제 query가 문자열로 들어간다)
+  // 3) ✅ 유료 핵심: 경쟁사 Top5 + 경쟁사 대표키워드 5개씩 수집
   // =========================================================
   if (page) {
     try {
       const query = buildCompetitorQuery(place);
-      const res = await fetchCompetitorsTop(page, {
+      const res = await fetchCompetitorsTop(page as any, {
         query,
         limit: 5,
-        excludePlaceId: place.placeId
+        excludePlaceId: place.placeId,
       });
 
-      place.competitors = res.competitors || [];
-      place._competitorDebug = res.debug || { used: true, query, limit: 5 };
+      const competitors = (res.competitors || []) as Competitor[];
+
+      // ✅ 각 경쟁사 홈에서 대표키워드 5개 파싱 (HTML 기반, 빠름)
+      const t0 = Date.now();
+      const kwSteps: any[] = [];
+
+      for (const c of competitors) {
+        try {
+          const kw = await fetchRepresentativeKeywords5ByFrameSource(`${basePlaceUrl(c.placeUrl)}/home`);
+          const k5 =
+            (kw.keywords5?.length ? kw.keywords5 : kw.raw?.slice(0, 5))?.slice(0, 5) || [];
+
+          c.keywords5 = k5.filter(Boolean);
+          c.debug = { via: "frame-keywordList", found: c.keywords5.length, ...(kw.debug || {}) };
+
+          kwSteps.push({ placeId: c.placeId, ok: true, found: c.keywords5.length });
+        } catch (e: any) {
+          c.keywords5 = [];
+          c.debug = { via: "frame-keywordList", ok: false, error: e?.message ?? String(e) };
+          kwSteps.push({ placeId: c.placeId, ok: false, error: e?.message ?? String(e) });
+        }
+      }
+
+      place.competitors = competitors;
+
+      // ✅ 집계: 경쟁사 키워드 Top10
+      const topKeywords10 = buildTopKeywords10(competitors);
+
+      // ✅ 유료 추천 대표키워드 5개 (경쟁사 Top + 내 강점 키워드 혼합)
+      const suggested5Pro = buildSuggestedKeywords5Pro(place, topKeywords10);
+
+      place._competitorDebug = {
+        ...(res.debug || {}),
+        keywordFetch: {
+          used: true,
+          elapsedMs: Date.now() - t0,
+          steps: kwSteps,
+        },
+        competitorTopKeywords10: topKeywords10,
+        suggested5Pro,
+      };
     } catch (e: any) {
       place._competitorDebug = { used: true, error: e?.message ?? "competitors failed" };
     }
@@ -159,7 +196,7 @@ export async function enrichPlace(place: PlaceProfileLike, ctx?: { page: any }):
   }
 
   // =========================================================
-  // 4) 점수/리포트
+  // 4) 점수/리포트 생성
   // =========================================================
   try {
     Object.assign(place, scorePlace(place));
@@ -168,6 +205,95 @@ export async function enrichPlace(place: PlaceProfileLike, ctx?: { page: any }):
   }
 
   return place;
+}
+
+/* ---------------- keyword aggregation ---------------- */
+
+function normalizeKw(s: string) {
+  return (s || "").replace(/\s+/g, " ").trim();
+}
+
+function buildTopKeywords10(competitors: Competitor[]) {
+  const freq = new Map<string, number>();
+
+  for (const c of competitors || []) {
+    for (const k of c.keywords5 || []) {
+      const kk = normalizeKw(k);
+      if (!kk) continue;
+      freq.set(kk, (freq.get(kk) || 0) + 1);
+    }
+  }
+
+  const sorted = Array.from(freq.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10)
+    .map(([keyword, count]) => ({ keyword, count }));
+
+  return sorted;
+}
+
+// ✅ “유료 추천 5개” 규칙:
+// - 경쟁사 Top10에서 3개 (빈도 높은 순, 너무 일반어 제외)
+// - 내 강점 키워드(아베다/염색/레이어드 등) 2개
+// - 지역 키워드 1~2개 포함하도록 보정
+function buildSuggestedKeywords5Pro(place: PlaceProfileLike, top10: { keyword: string; count: number }[]) {
+  const out: string[] = [];
+  const seen = new Set<string>();
+
+  const push = (k: string) => {
+    const kk = normalizeKw(k);
+    if (!kk) return;
+    if (seen.has(kk)) return;
+    seen.add(kk);
+    out.push(kk);
+  };
+
+  const genericBlock = ["미용실", "헤어샵", "헤어살롱"];
+
+  const addr = (place.address || "").toString();
+  const hasSeodaemun = addr.includes("서대문");
+  const hasJongno = addr.includes("종로");
+
+  // 1) 지역 2개 우선 (서대문역/서대문/종로구 중)
+  if (hasSeodaemun) {
+    push("서대문역 미용실");
+    push("서대문역 헤어샵");
+  } else if (hasJongno) {
+    push("종로구 미용실");
+    push("종로구 헤어샵");
+  } else {
+    push("해당 지역 미용실");
+    push("해당 지역 헤어샵");
+  }
+
+  // 2) 경쟁사 Top에서 “의미있는 것” 2~3개
+  for (const it of top10 || []) {
+    const k = it.keyword;
+    if (!k) continue;
+    if (genericBlock.includes(k)) continue;
+    // 지역/브랜드/서비스성 키워드 위주로만
+    push(k);
+    if (out.length >= 4) break;
+  }
+
+  // 3) 내 강점(현재 대표키워드에서) 1~2개 보충
+  const my = (place.keywords5?.length ? place.keywords5 : place.keywords || []).slice(0, 10);
+  for (const k of my) {
+    if (!k) continue;
+    if (genericBlock.includes(k)) continue;
+    push(k);
+    if (out.length >= 5) break;
+  }
+
+  // 4) 5개 맞추기 (부족하면 기본 서비스)
+  while (out.length < 5) {
+    push("아베다염색");
+    if (out.length < 5) push("레이어드컷");
+    if (out.length < 5) push("볼륨매직");
+    break;
+  }
+
+  return out.slice(0, 5);
 }
 
 /* ---------------- helpers ---------------- */
