@@ -1,12 +1,15 @@
+// src/services/enrichPlace.ts
 import { fetchMenusViaPlaywright, type Menu } from "./playwrightMenus.js";
 import { fetchExistingKeywordsViaPlaywright } from "./playwrightKeywords.js";
 import { fetchRepresentativeKeywords5ByFrameSource } from "./playwrightKeywordList.js";
-import { fetchTopPlaceIdsByQuery } from "./playwrightCompetitorSearch.js";
+import { scorePlace } from "./scorePlace.js";
+import { getMonthlySearchVolumeMap, attachVolumesToKeywords } from "./keywordVolume.js";
 
 type Competitor = {
   placeId: string;
   placeUrl: string;
   keywords5?: string[];
+  keywords5WithVolume?: { keyword: string; monthly?: number | null }[];
   debug?: any;
 };
 
@@ -19,25 +22,27 @@ type PlaceProfileLike = {
   roadAddress?: string;
   description?: string;
   directions?: string;
-
   tags?: string[];
 
-  // ✅ 대표키워드(원문 전체) + 5개
+  // ✅ 기존 대표키워드(원문 전체)
   keywords?: string[];
+  // ✅ 기존 대표키워드 5개(유료 전환용)
   keywords5?: string[];
 
-  // ✅ 메뉴(미용실: price만)
+  // ✅ 메뉴
   menus?: Menu[];
 
-  // ✅ 경쟁업체
+  // ✅ 경쟁업체(상위 1~5)
   competitors?: Competitor[];
 
-  reviews?: any;
-  photos?: { count?: number };
+  // ✅ 점수/리포트 확장 필드(동적)
+  [k: string]: any;
 
+  // ✅ 디버그
   _menuDebug?: any;
   _keywordDebug?: any;
   _competitorDebug?: any;
+  _volumeDebug?: any;
 };
 
 export async function enrichPlace(place: PlaceProfileLike): Promise<PlaceProfileLike> {
@@ -45,18 +50,20 @@ export async function enrichPlace(place: PlaceProfileLike): Promise<PlaceProfile
   const isHair = isHairSalon(place);
 
   // =========================
-  // 0) ✅ 대표키워드(최우선)
+  // 0) ✅ 기존 대표키워드(최우선)
+  //    1) "프레임 소스(keywordList)" 방식
+  //    2) 실패 시 기존 GraphQL/DOM 휴리스틱 폴백
   // =========================
   if (!place.keywords || place.keywords.length === 0) {
     const homeUrl = `${base}/home`;
 
-    // (A) frame source keywordList (정답 루트)
+    // (A) frame source keywordList 파싱 (정답 루트)
     try {
       const kw = await fetchRepresentativeKeywords5ByFrameSource(homeUrl);
 
       if (kw.raw?.length) {
         place.keywords = kw.raw.slice(0, 15);
-        place.keywords5 = kw.keywords5?.length ? kw.keywords5 : kw.raw.slice(0, 5);
+        place.keywords5 = kw.keywords5?.length ? kw.keywords5.slice(0, 5) : kw.raw.slice(0, 5);
       }
 
       place._keywordDebug = { via: "frame-keywordList", ...kw.debug };
@@ -64,7 +71,7 @@ export async function enrichPlace(place: PlaceProfileLike): Promise<PlaceProfile
       place._keywordDebug = { via: "frame-keywordList", error: e?.message ?? "keywordList parse failed" };
     }
 
-    // (B) fallback: GraphQL/DOM 휴리스틱
+    // (B) 그래도 없으면 폴백 (GraphQL/DOM)
     if (!place.keywords || place.keywords.length === 0) {
       try {
         const kw2 = await fetchExistingKeywordsViaPlaywright(homeUrl);
@@ -84,6 +91,7 @@ export async function enrichPlace(place: PlaceProfileLike): Promise<PlaceProfile
       }
     }
   } else {
+    // keywords가 이미 있으면 5개도 맞춰줌
     if (!place.keywords5 || place.keywords5.length === 0) {
       place.keywords5 = place.keywords.slice(0, 5);
     }
@@ -94,6 +102,7 @@ export async function enrichPlace(place: PlaceProfileLike): Promise<PlaceProfile
   // =========================
   if (isHair && (!place.menus || place.menus.length === 0)) {
     const priceUrl = `${base}/price`;
+
     try {
       const pw = await fetchMenusViaPlaywright(priceUrl);
 
@@ -109,84 +118,54 @@ export async function enrichPlace(place: PlaceProfileLike): Promise<PlaceProfile
   }
 
   // =========================
-  // 2) ✅ 경쟁업체(상위 1~5) 대표키워드 추출
-  // - 우선 쿼리는 "역/지역 + 업종" 형태가 제일 안정적
-  // - placeId가 있으면 자기 자신은 제외
+  // 2) ✅ 점수 산정(등급/개선포인트)
+  // - scorePlace.ts가 place 객체를 받아 계산해서 반환한다고 가정
   // =========================
-  if (!place.competitors || place.competitors.length === 0) {
-    const query = buildCompetitorQuery(place); // ex) "서대문역 미용실"
-    const myId = place.placeId;
+  try {
+    const audit = scorePlace(place);
+    // scorePlace가 { scores, keyword, recommend, todoTop5 ... } 같은 구조로 반환하는 형태를 그대로 merge
+    Object.assign(place, audit);
+  } catch (e: any) {
+    place._scoreDebug = { error: e?.message ?? "scorePlace failed" };
+  }
 
-    try {
-      const top = await fetchTopPlaceIdsByQuery(query, 5);
+  // =========================
+  // 3) ✅ 월간검색량(네이버 광고 API)
+  // - 추천키워드 5개 + 경쟁업체 키워드(각 5개)
+  // =========================
+  try {
+    // 추천키워드 5: scorePlace 결과 우선 → 없으면 기존 로직 fallback
+    const suggested5: string[] =
+      Array.isArray(place?.keyword?.suggested5) && place.keyword.suggested5.length
+        ? place.keyword.suggested5.slice(0, 5)
+        : Array.isArray(place?.recommend?.keywords5) && place.recommend.keywords5.length
+          ? place.recommend.keywords5.map((x: any) => x.keyword).slice(0, 5)
+          : [];
 
-      // ✅ 자기 자신 제거 + 중복 제거
-      const filteredIds = Array.from(new Set(top.placeIds)).filter((id) => (myId ? id !== myId : true)).slice(0, 5);
+    // 경쟁업체 키워드들(최대 25개)
+    const competitorKeywords: string[] = (place.competitors || []).flatMap((c) => (c.keywords5 || []).slice(0, 5));
 
-      const comps: Competitor[] = [];
-      for (const id of filteredIds) {
-        const url = `https://m.place.naver.com/place/${id}/home`;
-        try {
-          const kw = await fetchRepresentativeKeywords5ByFrameSource(url);
-          comps.push({
-            placeId: id,
-            placeUrl: `https://m.place.naver.com/place/${id}/home`,
-            keywords5: kw.keywords5?.length ? kw.keywords5 : kw.raw?.slice(0, 5),
-            debug: { ...kw.debug }
-          });
-        } catch (e: any) {
-          comps.push({
-            placeId: id,
-            placeUrl: `https://m.place.naver.com/place/${id}/home`,
-            keywords5: [],
-            debug: { error: e?.message ?? "competitor keywordList failed" }
-          });
-        }
-      }
+    // 합쳐서 조회(중복 제거는 내부에서)
+    const toQuery = [...suggested5, ...competitorKeywords].filter(Boolean);
 
-      place.competitors = comps;
+    if (toQuery.length) {
+      const vol = await getMonthlySearchVolumeMap(toQuery, { timeoutMs: 8000, batchSize: 50, debug: true });
 
-      place._competitorDebug = {
-        used: true,
-        query,
-        limit: 5,
-        steps: [
-          {
-            step: "searchTop",
-            used: true,
-            query,
-            limit: 5,
-            strategy: top.debug?.strategy ?? "unknown",
-            steps: top.debug?.steps ?? [],
-            sniffedUrls: top.debug?.sniffedUrls ?? [],
-            sniffedCount: top.debug?.sniffedCount ?? 0,
-            fallbackUsed: top.debug?.fallbackUsed ?? false
-          }
-        ]
-      };
-    } catch (e: any) {
-      place._competitorDebug = { used: true, query, limit: 5, error: e?.message ?? "competitor search failed" };
-      place.competitors = [];
+      place.suggested5WithVolume = attachVolumesToKeywords(suggested5, vol.volumes);
+      place.competitors = (place.competitors || []).map((c) => ({
+        ...c,
+        keywords5WithVolume: attachVolumesToKeywords(c.keywords5 || [], vol.volumes)
+      }));
+
+      place._volumeDebug = vol.debug;
+    } else {
+      place._volumeDebug = { used: true, skipped: true, reason: "no keywords to query" };
     }
+  } catch (e: any) {
+    place._volumeDebug = { used: true, error: e?.message ?? "volume attach failed" };
   }
 
   return place;
-}
-
-function buildCompetitorQuery(place: PlaceProfileLike) {
-  // ✅ 가장 보수적/안정적인 쿼리:
-  // 1) 상호명에서 “OO역” 있으면 "OO역 미용실"
-  // 2) 없으면 그냥 "미용실"로만 하면 경쟁이 너무 넓어져서 비추.
-  //    → 최소한 keywords5에 “서대문역미용실” 같은 경쟁사들이 쓰는 형태를 따라가야 함
-  const n = place.name || "";
-  const station = extractStationFromName(n);
-  const 업종 = "미용실"; // 지금은 hairshop 기준이므로 고정(나중에 category 기반 확장 가능)
-  return station ? `${station} ${업종}` : `${업종}`;
-}
-
-function extractStationFromName(name: string) {
-  const m = name.match(/([가-힣A-Za-z]+역)/);
-  return m?.[1] ?? null;
 }
 
 function isHairSalon(place: PlaceProfileLike) {
