@@ -1,6 +1,9 @@
 // src/services/playwrightCompetitors.ts
 import { chromium } from "playwright";
 
+const UA_MOBILE =
+  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
+
 type CompetitorItem = { placeId: string; placeUrl: string; name?: string; debug?: any };
 export type CompetitorSearchResult = { items: CompetitorItem[]; debug: any };
 
@@ -12,10 +15,7 @@ export async function fetchCompetitorsTop5ViaSearch(
   const started = Date.now();
 
   const browser = await chromium.launch({ args: ["--no-sandbox"] });
-  const page = await browser.newPage({
-    userAgent:
-      "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
-  });
+  const page = await browser.newPage({ userAgent: UA_MOBILE });
 
   try {
     const url1 = `https://m.place.naver.com/search?query=${encodeURIComponent(query)}`;
@@ -44,32 +44,36 @@ export async function fetchCompetitorsTop5ViaSearch(
 }
 
 async function extractPlaceCandidates(page: any, limit: number): Promise<CompetitorItem[]> {
-  // ✅ TS 레벨에서는 document를 모르므로 evaluate 안에서만 사용
-  const out = await page.evaluate((limitInner: number) => {
-    const anchors = Array.from(document.querySelectorAll("a")) as any[];
-    const urls = anchors.map((a) => (a && a.href ? String(a.href) : "")).filter(Boolean);
+  const fn = `
+    (limitInner) => {
+      const anchors = Array.from(document.querySelectorAll("a"));
+      const urls = anchors.map((a) => (a && a.href ? String(a.href) : "")).filter(Boolean);
 
-    const candidates: { placeId: string; placeUrl: string }[] = [];
-    const seen = new Set<string>();
+      const candidates = [];
+      const seen = new Set();
 
-    for (const u of urls) {
-      const m = u.match(/\/place\/(\d+)(\/home)?/);
-      if (!m?.[1]) continue;
+      for (const u of urls) {
+        const m = u.match(/\\/place\\/(\\d+)(\\/home)?/);
+        if (!m || !m[1]) continue;
 
-      const placeId = m[1];
-      if (seen.has(placeId)) continue;
-      seen.add(placeId);
+        const placeId = m[1];
+        if (seen.has(placeId)) continue;
+        seen.add(placeId);
 
-      candidates.push({
-        placeId,
-        placeUrl: `https://m.place.naver.com/place/${placeId}/home`
-      });
+        candidates.push({
+          placeId,
+          placeUrl: "https://m.place.naver.com/place/" + placeId + "/home"
+        });
 
-      if (candidates.length >= limitInner) break;
+        if (candidates.length >= limitInner) break;
+      }
+
+      return candidates;
     }
+  `;
 
-    return candidates;
-  }, limit);
+  // @ts-ignore
+  const out = await page.evaluate(eval(fn), limit);
 
   return Array.isArray(out) ? out.slice(0, limit) : [];
 }
