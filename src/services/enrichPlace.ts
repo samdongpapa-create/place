@@ -52,7 +52,7 @@ export async function enrichPlace(place: PlaceProfileLike, ctx?: { page: any }):
   const looksLikeReviewSnippet = (s?: string) => !!s && /(방문자리뷰|블로그리뷰)\s*\d+/i.test(s);
 
   // =========================================================
-  // 0) 기본필드(이름/주소/오시는길/상세설명)
+  // 0) 기본필드
   // =========================================================
   if (page) {
     try {
@@ -65,7 +65,6 @@ export async function enrichPlace(place: PlaceProfileLike, ctx?: { page: any }):
       if (empty(place.roadAddress)) place.roadAddress = bf.fields.roadAddress;
       if (empty(place.directions)) place.directions = bf.fields.directions;
 
-      // ✅ 기존 description이 “리뷰 스니펫”이면 덮어쓰기 허용
       if (empty(place.description) || looksLikeReviewSnippet(place.description)) {
         place.description = bf.fields.description;
       }
@@ -79,7 +78,7 @@ export async function enrichPlace(place: PlaceProfileLike, ctx?: { page: any }):
   }
 
   // =========================================================
-  // 1) 대표키워드 - frame source -> fallback
+  // 1) 대표키워드
   // =========================================================
   if (!place.keywords || place.keywords.length === 0) {
     const homeUrl = `${base}/home`;
@@ -120,7 +119,7 @@ export async function enrichPlace(place: PlaceProfileLike, ctx?: { page: any }):
   }
 
   // =========================================================
-  // 2) 메뉴/가격: 미용실은 /price Playwright만
+  // 2) 메뉴/가격
   // =========================================================
   if (isHair && (!place.menus || place.menus.length === 0)) {
     const priceUrl = `${base}/price`;
@@ -139,12 +138,17 @@ export async function enrichPlace(place: PlaceProfileLike, ctx?: { page: any }):
   }
 
   // =========================================================
-  // 3) 경쟁사 Top5 (유료 핵심) - 다음 카테고리에서 “query [object Object]” 고침
+  // 3) ✅ 유료 핵심: 경쟁사 Top5 (이제 query가 문자열로 들어간다)
   // =========================================================
   if (page) {
     try {
       const query = buildCompetitorQuery(place);
-      const res = await fetchCompetitorsTop(page, { query, limit: 5, excludePlaceId: place.placeId } as any);
+      const res = await fetchCompetitorsTop(page, {
+        query,
+        limit: 5,
+        excludePlaceId: place.placeId
+      });
+
       place.competitors = res.competitors || [];
       place._competitorDebug = res.debug || { used: true, query, limit: 5 };
     } catch (e: any) {
@@ -155,7 +159,7 @@ export async function enrichPlace(place: PlaceProfileLike, ctx?: { page: any }):
   }
 
   // =========================================================
-  // 4) 점수/리포트 생성
+  // 4) 점수/리포트
   // =========================================================
   try {
     Object.assign(place, scorePlace(place));
@@ -171,7 +175,7 @@ export async function enrichPlace(place: PlaceProfileLike, ctx?: { page: any }):
 function isHairSalon(place: PlaceProfileLike) {
   const c = (place.category || "").toLowerCase();
   const n = (place.name || "").toLowerCase();
-  return c.includes("미용실") || n.includes("헤어") || n.includes("hair");
+  return c.includes("미용실") || n.includes("헤어") || n.includes("hair") || place.placeUrl.includes("/hairshop/");
 }
 
 function basePlaceUrl(url: string) {
