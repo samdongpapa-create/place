@@ -13,6 +13,9 @@ import { scorePlace } from "../services/score.js";
 import { recommendForPlace } from "../services/recommend.js";
 import { applyPlanToRecommend } from "../services/applyPlan.js";
 
+// ✅ PRO 잠금 해제 + blocks.value 주입
+import { applyPlanToPlace } from "../services/applyPlanToPlace.js";
+
 import { chromium } from "playwright";
 
 export const analyzeRouter = Router();
@@ -25,7 +28,7 @@ analyzeRouter.post("/analyze", async (req, res) => {
   if (!parsed.success) {
     return res.status(400).json({
       error: "INVALID_REQUEST",
-      details: parsed.error.flatten()
+      details: parsed.error.flatten(),
     });
   }
 
@@ -36,47 +39,44 @@ analyzeRouter.post("/analyze", async (req, res) => {
     resolved: {},
     home: {},
     priceProbe: {},
-    playwright: {}
+    playwright: {},
   };
 
   let browser: any = null;
   let page: any = null;
 
   try {
-    // 1️⃣ 플레이스 resolve
+    // 1) 플레이스 resolve
     const resolved = await resolvePlace(input as any, options as any);
 
     debug.resolved = {
       placeUrl: resolved.placeUrl,
       confidence: resolved.confidence,
-      placeId: resolved.placeId ?? null
+      placeId: resolved.placeId ?? null,
     };
 
-    // 2️⃣ 기본 HTML fetch
+    // 2) 기본 HTML fetch
     const fetchedHome = await fetchPlaceHtml(resolved.placeUrl, {
       minLength: 120,
       retries: 1,
       timeoutMs: 9000,
-      debug: true
+      debug: true,
     });
 
     debug.home = {
       finalUrl: fetchedHome.finalUrl,
       len: fetchedHome.html.length,
-      hasNextData: hasNext(fetchedHome.html)
+      hasNextData: hasNext(fetchedHome.html),
     };
 
-    const rawPlace = parsePlaceFromHtml(
-      fetchedHome.html,
-      fetchedHome.finalUrl
-    );
+    const rawPlace = parsePlaceFromHtml(fetchedHome.html, fetchedHome.finalUrl);
 
     let place = normalizePlace({
       ...rawPlace,
-      placeUrl: fetchedHome.finalUrl
+      placeUrl: fetchedHome.finalUrl,
     }) as any;
 
-    // 3️⃣ price probe (단순 판정용)
+    // 3) price probe (단순 판정용)
     try {
       const placeId = place?.placeId || resolved.placeId;
 
@@ -91,23 +91,22 @@ analyzeRouter.post("/analyze", async (req, res) => {
         minLength: 120,
         retries: 1,
         timeoutMs: 9000,
-        debug: true
+        debug: true,
       });
 
       debug.priceProbe = {
         url: priceUrl,
         finalUrl: fetchedPrice.finalUrl,
         len: fetchedPrice.html.length,
-        hasNextData: hasNext(fetchedPrice.html)
+        hasNextData: hasNext(fetchedPrice.html),
       };
     } catch (e: any) {
       debug.priceProbe = { error: e?.message ?? String(e) };
     }
 
     // =========================================================
-    // 4️⃣ Playwright 실행 (상용화 핵심)
+    // 4) Playwright 실행 (상용화 핵심)
     // =========================================================
-
     const t0 = Date.now();
 
     browser = await chromium.launch({
@@ -116,15 +115,15 @@ analyzeRouter.post("/analyze", async (req, res) => {
         "--no-sandbox",
         "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
-        "--disable-gpu"
-      ]
+        "--disable-gpu",
+      ],
     });
 
     const context = await browser.newContext({
       viewport: { width: 390, height: 844 },
       locale: "ko-KR",
       userAgent:
-        "Mozilla/5.0 (Linux; Android 13; SM-G991N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36"
+        "Mozilla/5.0 (Linux; Android 13; SM-G991N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36",
     });
 
     // ✅ 타입 에러 방지 위해 route: any 명시
@@ -140,29 +139,25 @@ analyzeRouter.post("/analyze", async (req, res) => {
 
     debug.playwright = {
       used: true,
-      headless: true
+      headless: true,
     };
 
-    // 🔥 enrichPlace에 page 전달 (이제 ctx.page missing 안 뜸)
+    // 🔥 enrichPlace에 page 전달
     place = await enrichPlace(place, { page });
 
     debug.playwright.elapsedMs = Date.now() - t0;
 
     // =========================================================
-    // 5️⃣ 점수 + 추천
+    // 5) 점수 + 추천
     // =========================================================
-
     const industry = autoClassifyIndustry(place);
     const scores = scorePlace(place, industry.vertical);
-    const recommendRaw = recommendForPlace(
-      place,
-      scores,
-      industry.subcategory
-    );
-    const recommend = applyPlanToRecommend(
-      options.plan,
-      recommendRaw
-    );
+
+    const recommendRaw = recommendForPlace(place, scores, industry.subcategory);
+    const recommend = applyPlanToRecommend(options.plan, recommendRaw);
+
+    // ✅ PRO면 place.audit.pro.blocks.value에 _proRaw 주입 + locked=false
+    place = applyPlanToPlace(options.plan, place);
 
     return res.json({
       meta: {
@@ -173,12 +168,12 @@ analyzeRouter.post("/analyze", async (req, res) => {
         resolvedFrom: resolved.placeUrl,
         resolvedConfidence: resolved.confidence ?? null,
         fetchedAt: new Date().toISOString(),
-        debug
+        debug,
       },
       industry,
       place,
       scores,
-      recommend
+      recommend,
     });
   } catch (e: any) {
     console.error("❌ ANALYZE ERROR", e);
@@ -186,7 +181,7 @@ analyzeRouter.post("/analyze", async (req, res) => {
     return res.status(500).json({
       error: "ANALYZE_FAILED",
       message: e?.message ?? "unknown error",
-      debug
+      debug,
     });
   } finally {
     try {
@@ -198,4 +193,3 @@ analyzeRouter.post("/analyze", async (req, res) => {
     } catch {}
   }
 });
-
