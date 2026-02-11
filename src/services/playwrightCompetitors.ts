@@ -1,152 +1,141 @@
 // src/services/playwrightCompetitors.ts
-import { chromium } from "playwright";
-import { fetchRepresentativeKeywords5ByFrameSource } from "./playwrightKeywordList.js";
+import type { Page } from "playwright";
 
-const UA_MOBILE =
-  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
-
-export type Competitor = {
+type Competitor = {
   placeId: string;
   placeUrl: string;
   keywords5?: string[];
   debug?: any;
 };
 
-export type CompetitorSearchResult = {
-  competitors: Competitor[];
-  debug: any;
+type Opts = {
+  query: string;
+  limit?: number;
+  excludePlaceId?: string;
+  timeoutMs?: number;
 };
 
-function buildHeaders(extra?: Record<string, string>) {
-  return {
-    "User-Agent": UA_MOBILE,
-    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.7,en;q=0.6",
-    "Cache-Control": "no-cache",
-    Pragma: "no-cache",
-    Referer: "https://m.place.naver.com/",
-    ...(extra || {})
-  };
-}
-
-function uniq<T>(arr: T[]) {
-  return Array.from(new Set(arr));
-}
-
-function extractPlaceIdsFromHtml(html: string): string[] {
-  const out: string[] = [];
-
-  // href="/place/12345" or "/hairshop/12345" or full urls
-  const re1 = /\/place\/(\d+)/g;
-  const re2 = /\/hairshop\/(\d+)/g;
-  const re3 = /m\.place\.naver\.com\/place\/(\d+)/g;
-  const re4 = /m\.place\.naver\.com\/hairshop\/(\d+)/g;
-
-  for (const re of [re1, re2, re3, re4]) {
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(html))) {
-      if (m[1]) out.push(m[1]);
-    }
-  }
-
-  return uniq(out);
-}
-
-function toHomeUrl(placeId: string) {
-  return `https://m.place.naver.com/place/${placeId}/home`;
-}
-
-// ✅ 핵심: 검색은 "역+업종"으로 고정하는 게 흔들림이 적음
 export async function fetchCompetitorsTop(
-  query: string,
-  opts: { limit?: number; excludePlaceId?: string; timeoutMs?: number } = {}
-): Promise<CompetitorSearchResult> {
-  const started = Date.now();
-  const limit = typeof opts.limit === "number" ? opts.limit : 5;
-  const exclude = opts.excludePlaceId ? String(opts.excludePlaceId) : "";
-  const timeoutMs = typeof opts.timeoutMs === "number" ? opts.timeoutMs : 15000;
+  page: Page,
+  opts: Opts
+): Promise<{ competitors: Competitor[]; debug: any }> {
+  const t0 = Date.now();
+  const limit = Math.max(1, Math.min(opts.limit ?? 5, 10));
+  const timeoutMs = opts.timeoutMs ?? 12000;
 
   const debug: any = {
     used: true,
-    query,
+    query: opts.query,
     limit,
-    excludePlaceId: exclude || undefined,
-    steps: []
+    excludePlaceId: opts.excludePlaceId ?? null,
+    steps: [],
+    elapsedMs: 0,
+    foundCandidates: 0
   };
 
-  // 1) m.place 검색 (가끔 HTML이 너무 짧거나 결과가 안 뜸)
-  let candidates: string[] = [];
-  try {
-    const u = `https://m.place.naver.com/search?query=${encodeURIComponent(query)}`;
-    const res = await fetch(u, { headers: buildHeaders() });
-    const html = await res.text();
+  const step = (s: any) => debug.steps.push({ at: Date.now() - t0, ...s });
 
-    const ids = extractPlaceIdsFromHtml(html);
-    candidates = ids;
-
-    debug.steps.push({
-      step: "m.place.search",
-      url: u,
-      ok: res.ok,
-      htmlLen: html.length,
-      found: ids.length
-    });
-  } catch (e: any) {
-    debug.steps.push({ step: "m.place.search", error: e?.message ?? "failed" });
+  const q = (opts.query || "").toString().trim();
+  if (!q) {
+    debug.elapsedMs = Date.now() - t0;
+    return { competitors: [], debug };
   }
 
-  // 2) fallback: m.search (더 잘 뜨는 편)
-  if (candidates.length < limit) {
-    try {
-      const u = `https://m.search.naver.com/search.naver?query=${encodeURIComponent(query)}&where=m`;
-      const res = await fetch(u, { headers: buildHeaders({ Referer: "https://m.search.naver.com/" }) });
-      const html = await res.text();
-
-      const ids = extractPlaceIdsFromHtml(html);
-      candidates = uniq([...candidates, ...ids]);
-
-      debug.steps.push({
-        step: "fallback.m.search",
-        url: u,
-        ok: res.ok,
-        htmlLen: html.length,
-        found: ids.length,
-        merged: candidates.length
-      });
-    } catch (e: any) {
-      debug.steps.push({ step: "fallback.m.search", error: e?.message ?? "failed" });
-    }
-  }
-
-  // 자기 자신 제외 + limit 컷
-  candidates = candidates.filter((id) => id && id !== exclude).slice(0, limit);
-
-  // 경쟁사 키워드 5개 추출 (frame keywordList)
+  const seen = new Set<string>();
   const competitors: Competitor[] = [];
 
-  // Playwright는 키워드 추출 함수 내부에서 쓰고 있으니, 여기서는 병렬로 돌리면 너무 무거울 수 있음
-  for (const pid of candidates) {
-    const homeUrl = toHomeUrl(pid);
+  // -----------------------------
+  // helper: URL에서 placeId 추출
+  // -----------------------------
+  const extractPlaceId = (url: string) => {
+    const u = url || "";
+    // /place/123, /hairshop/123, /restaurant/123 등
+    const m =
+      u.match(/\/place\/(\d+)/) ||
+      u.match(/\/hairshop\/(\d+)/) ||
+      u.match(/\/restaurant\/(\d+)/) ||
+      u.match(/\/hospital\/(\d+)/) ||
+      u.match(/\/accommodation\/(\d+)/) ||
+      u.match(/\/(\d+)\/home/);
+    return m?.[1] || "";
+  };
+
+  const pushCandidate = (placeId: string) => {
+    if (!placeId) return;
+    if (opts.excludePlaceId && placeId === opts.excludePlaceId) return;
+    if (seen.has(placeId)) return;
+    seen.add(placeId);
+
+    const placeUrl = `https://m.place.naver.com/place/${placeId}/home`;
+    competitors.push({ placeId, placeUrl });
+  };
+
+  // -----------------------------------------
+  // 1) m.place.naver.com/search (우선)
+  // -----------------------------------------
+  const url1 = `https://m.place.naver.com/search?query=${encodeURIComponent(q)}`;
+  try {
+    step({ step: "m.place.search", url: url1 });
+    await page.goto(url1, { waitUntil: "domcontentloaded", timeout: timeoutMs });
+    await page.waitForTimeout(900);
+
+    const html = await page.content();
+    step({ step: "m.place.search.content", htmlLen: html.length });
+
+    // a href 전체에서 placeId 패턴을 최대한 긁는다
+    const ids = Array.from(
+      new Set(
+        (html.match(/https?:\/\/m\.place\.naver\.com\/(?:place|hairshop|restaurant|hospital|accommodation)\/\d+/g) || [])
+          .map((u) => extractPlaceId(u))
+          .filter(Boolean)
+      )
+    );
+
+    for (const id of ids) {
+      pushCandidate(id);
+      if (competitors.length >= limit) break;
+    }
+
+    step({ step: "m.place.search.parsed", found: competitors.length });
+  } catch (e: any) {
+    step({ step: "m.place.search.fail", ok: false, error: e?.message ?? String(e) });
+  }
+
+  // -----------------------------------------
+  // 2) fallback: m.search.naver.com (모바일 검색)
+  // -----------------------------------------
+  if (competitors.length < limit) {
+    const url2 = `https://m.search.naver.com/search.naver?where=m&query=${encodeURIComponent(q)}`;
     try {
-      const kw = await fetchRepresentativeKeywords5ByFrameSource(homeUrl);
-      competitors.push({
-        placeId: pid,
-        placeUrl: homeUrl,
-        keywords5: (kw.keywords5?.length ? kw.keywords5 : kw.raw || []).slice(0, 5),
-        debug: kw.debug
-      });
+      step({ step: "fallback.m.search", url: url2 });
+      await page.goto(url2, { waitUntil: "domcontentloaded", timeout: timeoutMs });
+      await page.waitForTimeout(900);
+
+      const html2 = await page.content();
+      step({ step: "fallback.m.search.content", htmlLen: html2.length });
+
+      // placeId가 섞여 나오는 링크들에서 최대한 추출
+      const ids2 = Array.from(
+        new Set(
+          (html2.match(/m\.place\.naver\.com\/(?:place|hairshop|restaurant|hospital|accommodation)\/\d+/g) || [])
+            .map((u) => extractPlaceId(`https://${u.replace(/^https?:\/\//, "")}`))
+            .filter(Boolean)
+        )
+      );
+
+      for (const id of ids2) {
+        pushCandidate(id);
+        if (competitors.length >= limit) break;
+      }
+
+      step({ step: "fallback.m.search.parsed", found: competitors.length });
     } catch (e: any) {
-      competitors.push({
-        placeId: pid,
-        placeUrl: homeUrl,
-        keywords5: [],
-        debug: { error: e?.message ?? "keyword fetch failed" }
-      });
+      step({ step: "fallback.m.search.fail", ok: false, error: e?.message ?? String(e) });
     }
   }
 
-  debug.elapsedMs = Date.now() - started;
-  debug.foundCandidates = candidates.length;
+  debug.foundCandidates = competitors.length;
+  debug.elapsedMs = Date.now() - t0;
 
-  return { competitors, debug };
+  return { competitors: competitors.slice(0, limit), debug };
 }
