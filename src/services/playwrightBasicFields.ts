@@ -1,7 +1,7 @@
 // src/services/playwrightBasicFields.ts
 import { chromium } from "playwright";
 
-type BasicFieldsResult = {
+export type BasicFieldsResult = {
   name?: string;
   category?: string;
   address?: string;
@@ -23,70 +23,73 @@ export async function fetchBasicFieldsViaPlaywright(homeUrl: string): Promise<Ba
     await page.goto(homeUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
     await page.waitForTimeout(250);
 
+    // ✅ TS 레벨에서는 document/Element/HTMLMetaElement를 절대 쓰지 않는다.
     const data = await page.evaluate(() => {
-      const text = (el: Element | null) => (el ? (el.textContent || "").trim() : "");
-      const pickFirst = (sels: string[]) => {
+      const text = (el: any) => (el ? String(el.textContent || "").trim() : "");
+
+      const q = (sel: string) => (typeof document !== "undefined" ? document.querySelector(sel) : null);
+
+      const pickFirstText = (sels: string[]) => {
         for (const s of sels) {
-          const el = document.querySelector(s);
+          const el = q(s);
           const t = text(el);
           if (t) return t;
         }
         return "";
       };
 
-      // 이름/카테고리(가끔 meta로도 존재)
-      const name =
-        (document.querySelector('meta[property="og:title"]') as HTMLMetaElement | null)?.content?.trim() ||
-        pickFirst(["h1", "[data-testid='store-name']", ".place_title"]);
-
-      const category = pickFirst([".place_category", "[data-testid='category']", "span.category"]);
-
-      // 주소: 네이버 플레이스는 “주소/도로명”이 섞여 나올 수 있어 다중 셀렉터
-      const address = pickFirst([
-        "a[href*='map.naver.com']",
-        "span.addr",
-        ".place_detail_info .addr",
-        "[data-testid='address']"
-      ]);
-
-      const roadAddress = pickFirst([
-        "span.road_addr",
-        ".place_detail_info .road_addr",
-        "[data-testid='roadAddress']"
-      ]);
-
-      // 오시는길: “찾아오는길/오시는 길” 섹션이 있으면 텍스트를 긁음
-      const directions = (() => {
-        const candidates = Array.from(document.querySelectorAll("section,div"))
-          .map((el) => (el.textContent || "").trim())
-          .filter((t) => t.includes("오시는") || t.includes("찾아오는") || t.includes("도보"));
-        // 너무 긴 건 컷
-        const best = candidates.sort((a, b) => b.length - a.length)[0] || "";
-        return best.length > 0 ? best.slice(0, 400) : "";
+      const ogTitle = (() => {
+        const m: any = q('meta[property="og:title"]');
+        const c = m && m.content ? String(m.content).trim() : "";
+        return c;
       })();
 
-      // 사진 수: UI마다 다르니 숫자 패턴으로 추정
-      const bodyText = (document.body?.innerText || "").replace(/\s+/g, " ");
-      const m = bodyText.match(/사진\s*([0-9,]{1,7})/);
-      const photoCount = m?.[1] ? Number(m[1].replace(/,/g, "")) : null;
+      const name = ogTitle || pickFirstText(["h1", ".place_title", "[data-testid='store-name']"]);
+      const category = pickFirstText([".place_category", "span.category", "[data-testid='category']"]);
 
-      return {
-        name,
-        category,
-        address,
-        roadAddress,
-        directions,
-        photoCount
-      };
+      // 주소/도로명주소(셀렉터는 계속 튜닝 가능)
+      const address = pickFirstText([
+        "[data-testid='address']",
+        ".place_detail_info .addr",
+        "span.addr",
+        "a[href*='map.naver.com']"
+      ]);
+
+      const roadAddress = pickFirstText([
+        "[data-testid='roadAddress']",
+        ".place_detail_info .road_addr",
+        "span.road_addr"
+      ]);
+
+      // 오시는길: 섹션 텍스트 중 키워드 포함하는 블록을 찾는다
+      const directions = (() => {
+        const nodes = Array.from(document.querySelectorAll("section,div")) as any[];
+        const cands = nodes
+          .map((el) => String(el?.textContent || "").trim())
+          .filter((t) => t && (t.includes("오시는") || t.includes("찾아오는") || t.includes("도보")));
+        const best = cands.sort((a, b) => b.length - a.length)[0] || "";
+        return best ? best.slice(0, 500) : "";
+      })();
+
+      // 사진 수 추정(정확하지 않아도 score에 쓰기엔 충분)
+      const photoCount = (() => {
+        const bodyText = String(document.body?.innerText || "").replace(/\s+/g, " ");
+        const m = bodyText.match(/사진\s*([0-9,]{1,7})/);
+        if (!m?.[1]) return null;
+        const n = Number(String(m[1]).replace(/,/g, ""));
+        return Number.isFinite(n) ? n : null;
+      })();
+
+      return { name, category, address, roadAddress, directions, photoCount };
     });
 
     return {
-      name: data.name || undefined,
-      category: data.category || undefined,
-      address: data.address || undefined,
-      roadAddress: data.roadAddress || undefined,
-      directions: data.directions || undefined,
-      photoCount: typeof data.photoCount === "number" && Number.isFinite(data.photoCount) ? data.photoCount : undefined,
+      name: data?.name || undefined,
+      category: data?.category || undefined,
+      address: data?.address || undefined,
+      roadAddress: data?.roadAddress || undefined,
+      directions: data?.directions || undefined,
+      photoCount: typeof data?.photoCount === "number" ? data.photoCount : undefined,
       debug: { used: true, targetUrl: homeUrl, elapsedMs: Date.now() - started }
     };
   } finally {
