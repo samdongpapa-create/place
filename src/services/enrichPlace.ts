@@ -3,13 +3,13 @@ import { fetchMenusViaPlaywright, type Menu } from "./playwrightMenus.js";
 import { fetchExistingKeywordsViaPlaywright } from "./playwrightKeywords.js";
 import { fetchRepresentativeKeywords5ByFrameSource } from "./playwrightKeywordList.js";
 import { scorePlace } from "./scorePlace.js";
-import { getMonthlySearchVolumeMap, attachVolumesToKeywords } from "./keywordVolume.js";
+import { getMonthlySearchVolumeMap, attachVolumesToKeywords, type KeywordVolume } from "./keywordVolume.js";
 
 type Competitor = {
   placeId: string;
   placeUrl: string;
   keywords5?: string[];
-  keywords5WithVolume?: { keyword: string; monthly?: number | null }[];
+  keywords5WithVolume?: { keyword: string; volume?: KeywordVolume }[];
   debug?: any;
 };
 
@@ -35,6 +35,9 @@ type PlaceProfileLike = {
   // ✅ 경쟁업체(상위 1~5)
   competitors?: Competitor[];
 
+  // ✅ 추천키워드(볼륨 포함) - 유료/신뢰 요소
+  suggested5WithVolume?: { keyword: string; volume?: KeywordVolume }[];
+
   // ✅ 점수/리포트 확장 필드(동적)
   [k: string]: any;
 
@@ -43,6 +46,7 @@ type PlaceProfileLike = {
   _keywordDebug?: any;
   _competitorDebug?: any;
   _volumeDebug?: any;
+  _scoreDebug?: any;
 };
 
 export async function enrichPlace(place: PlaceProfileLike): Promise<PlaceProfileLike> {
@@ -119,22 +123,21 @@ export async function enrichPlace(place: PlaceProfileLike): Promise<PlaceProfile
 
   // =========================
   // 2) ✅ 점수 산정(등급/개선포인트)
-  // - scorePlace.ts가 place 객체를 받아 계산해서 반환한다고 가정
   // =========================
   try {
     const audit = scorePlace(place);
-    // scorePlace가 { scores, keyword, recommend, todoTop5 ... } 같은 구조로 반환하는 형태를 그대로 merge
     Object.assign(place, audit);
   } catch (e: any) {
     place._scoreDebug = { error: e?.message ?? "scorePlace failed" };
   }
 
   // =========================
-  // 3) ✅ 월간검색량(네이버 광고 API)
+  // 3) ✅ 월간검색량(네이버 광고 API/스텁)
   // - 추천키워드 5개 + 경쟁업체 키워드(각 5개)
+  // - keywordVolume.ts가 스텁이어도 "표시/타입/흐름"은 유지됨
   // =========================
   try {
-    // 추천키워드 5: scorePlace 결과 우선 → 없으면 기존 로직 fallback
+    // 추천키워드 5: scorePlace 결과 우선 → 없으면 recommend fallback
     const suggested5: string[] =
       Array.isArray(place?.keyword?.suggested5) && place.keyword.suggested5.length
         ? place.keyword.suggested5.slice(0, 5)
@@ -145,22 +148,35 @@ export async function enrichPlace(place: PlaceProfileLike): Promise<PlaceProfile
     // 경쟁업체 키워드들(최대 25개)
     const competitorKeywords: string[] = (place.competitors || []).flatMap((c) => (c.keywords5 || []).slice(0, 5));
 
-    // 합쳐서 조회(중복 제거는 내부에서)
-    const toQuery = [...suggested5, ...competitorKeywords].filter(Boolean);
+    // 합쳐서 조회
+    const toQuery = [...suggested5, ...competitorKeywords].map((x) => (x || "").trim()).filter(Boolean);
 
-    if (toQuery.length) {
-      const vol = await getMonthlySearchVolumeMap(toQuery, { timeoutMs: 8000, batchSize: 50, debug: true });
-
-      place.suggested5WithVolume = attachVolumesToKeywords(suggested5, vol.volumes);
-      place.competitors = (place.competitors || []).map((c) => ({
-        ...c,
-        keywords5WithVolume: attachVolumesToKeywords(c.keywords5 || [], vol.volumes)
-      }));
-
-      place._volumeDebug = vol.debug;
-    } else {
+    if (!toQuery.length) {
       place._volumeDebug = { used: true, skipped: true, reason: "no keywords to query" };
+      return place;
     }
+
+    // ✅ map 형태로 반환됨
+    const volumeMap = await getMonthlySearchVolumeMap(toQuery, { timeoutMs: 8000, batchSize: 50 });
+
+    // ✅ 표시용(추천키워드 5)
+    place.suggested5WithVolume = await attachVolumesToKeywords(suggested5, { timeoutMs: 8000, batchSize: 50 });
+
+    // ✅ 경쟁업체별 키워드 볼륨
+    const nextCompetitors: Competitor[] = [];
+    for (const c of place.competitors || []) {
+      const kwv = await attachVolumesToKeywords(c.keywords5 || [], { timeoutMs: 8000, batchSize: 50 });
+      nextCompetitors.push({ ...c, keywords5WithVolume: kwv });
+    }
+    place.competitors = nextCompetitors;
+
+    // 디버그: map 일부만
+    place._volumeDebug = {
+      used: true,
+      queried: toQuery.length,
+      unique: Object.keys(volumeMap || {}).length,
+      source: "keywordVolume.ts"
+    };
   } catch (e: any) {
     place._volumeDebug = { used: true, error: e?.message ?? "volume attach failed" };
   }
