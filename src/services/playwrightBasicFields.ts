@@ -1,13 +1,15 @@
 // src/services/playwrightBasicFields.ts
-import { chromium } from "playwright";
+import type { Page } from "playwright";
 
 export type BasicFields = {
   name?: string;
   category?: string;
   address?: string;
   roadAddress?: string;
-  description?: string;
+  // ✅ 네가 말하는 "오시는길"
   directions?: string;
+  // ✅ 네가 말하는 "상세설명(소개글)"
+  description?: string;
   photoCount?: number;
 };
 
@@ -16,208 +18,247 @@ export type BasicFieldsResult = {
   debug: any;
 };
 
-/**
- * ✅ tsconfig(lib dom) 없이도 빌드되도록:
- * - page.evaluate(() => document...) 형태를 쓰지 않고,
- * - "문자열 함수"를 evaluate에 넣어 TS의 DOM 타입체크를 회피.
- */
-export async function fetchBasicFieldsViaPlaywright(
-  homeUrl: string,
-  opts: { timeoutMs?: number; photo?: boolean; debug?: boolean } = {}
-): Promise<BasicFieldsResult> {
-  const timeoutMs = typeof opts.timeoutMs === "number" ? opts.timeoutMs : 12000;
-  const withPhoto = opts.photo !== false;
-  const debugOn = !!opts.debug;
+type Opts = {
+  timeoutMs?: number;
+};
 
-  const debug: any = { used: true, targetUrl: homeUrl, steps: [] as any[] };
+export async function fetchBasicFieldsViaPlaywright(
+  page: Page,
+  homeUrl: string,
+  opts: Opts = {}
+): Promise<BasicFieldsResult> {
+  const t0 = Date.now();
+  const timeoutMs = opts.timeoutMs ?? 15000;
+
+  const debug: any = {
+    used: true,
+    targetUrl: stripQuery(homeUrl),
+    steps: [],
+    picked: {},
+  };
+
   const fields: BasicFields = {};
 
-  const browser = await chromium.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-dev-shm-usage"]
-  });
+  // 1) HOME 진입
+  await page.goto(homeUrl, { waitUntil: "domcontentloaded", timeout: timeoutMs });
+  debug.steps.push({ step: "goto.home", elapsedMs: Date.now() - t0 });
 
-  const ctx = await browser.newContext({
-    userAgent:
-      "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-    locale: "ko-KR"
-  });
+  // 약간 기다려야 NEXT_DATA/렌더가 안정화됨
+  await page.waitForTimeout(600);
 
-  const page = await ctx.newPage();
+  // 2) DOM + meta + nextdata 후보를 한 번에 수집
+  const raw = await page.evaluate(() => {
+    const d = (globalThis as any).document;
 
-  try {
-    const t0 = Date.now();
-    await page.goto(homeUrl, { waitUntil: "domcontentloaded", timeout: timeoutMs });
-    await page.waitForTimeout(900);
-    debug.steps.push({ step: "goto.home", elapsedMs: Date.now() - t0 });
-
-    // ✅ DOM 접근은 "문자열 evaluate"로 실행
-    const homeEval = `
-      (() => {
-        const out = {};
-
-        const pickString = (...xs) => {
-          for (const v of xs) {
-            if (typeof v === "string" && v.trim()) return v.trim();
-          }
-          return undefined;
-        };
-
-        const getNextData = () => {
-          const el = document.querySelector("#__NEXT_DATA__");
-          const txt = el && el.textContent ? el.textContent : "";
-          if (!txt) return null;
-          try { return JSON.parse(txt); } catch { return null; }
-        };
-
-        const nd = getNextData();
-        if (nd) out._nextData = true;
-
-        const h1 = document.querySelector("h1");
-        const title = document.title || "";
-        out.name =
-          pickString(
-            nd && nd.props && nd.props.pageProps && nd.props.pageProps.page && nd.props.pageProps.page.name,
-            nd && nd.props && nd.props.pageProps && nd.props.pageProps.name,
-            nd && nd.props && nd.props.pageProps && nd.props.pageProps.initialState && nd.props.pageProps.initialState.place && nd.props.pageProps.initialState.place.name
-          ) || pickString(h1 && h1.textContent, title.replace(" : 네이버", ""));
-
-        out.category = pickString(
-          nd && nd.props && nd.props.pageProps && nd.props.pageProps.page && (nd.props.pageProps.page.category || nd.props.pageProps.page.categoryName),
-          nd && nd.props && nd.props.pageProps && nd.props.pageProps.initialState && nd.props.pageProps.initialState.place && nd.props.pageProps.initialState.place.category
-        );
-
-        const metaOg = document.querySelector('meta[property="og:description"]');
-        const metaDesc = document.querySelector('meta[name="description"]');
-        const metaText = (metaOg && metaOg.getAttribute("content")) || (metaDesc && metaDesc.getAttribute("content")) || "";
-
-        const findByLabel = (label) => {
-          const nodes = Array.from(document.querySelectorAll("*"));
-          for (const n of nodes) {
-            const t = (n.textContent || "").trim();
-            if (t === label) {
-              const box = n.closest("section, div") || n.parentElement;
-              const txt = box && (box.innerText || box.textContent) ? (box.innerText || box.textContent) : "";
-              if (txt && txt.length > 30) return txt;
-            }
-          }
-          return "";
-        };
-
-        // description candidates
-        const nextCandidates = [
-          nd && nd.props && nd.props.pageProps && nd.props.pageProps.page && (nd.props.pageProps.page.description || nd.props.pageProps.page.businessSummary || nd.props.pageProps.page.intro || nd.props.pageProps.page.introduction),
-          nd && nd.props && nd.props.pageProps && nd.props.pageProps.initialState && nd.props.pageProps.initialState.place && (nd.props.pageProps.initialState.place.description || nd.props.pageProps.initialState.place.introduction || nd.props.pageProps.initialState.place.bizDescription)
-        ].filter(Boolean);
-
-        const introDom = findByLabel("소개") || findByLabel("업체소개") || "";
-        out.description = pickString(...nextCandidates, metaText, introDom);
-
-        // 리뷰 카운트 문구가 짧게 들어오는 오염 방지
-        if (out.description && /방문\\s*자리뷰|블로그\\s*리뷰/.test(out.description) && out.description.length < 120) {
-          out.description = undefined;
-        }
-
-        // directions
-        const dirDom = findByLabel("찾아가는길") || findByLabel("오시는길") || "";
-        const dirCandidates = [
-          nd && nd.props && nd.props.pageProps && nd.props.pageProps.page && (nd.props.pageProps.page.directions || nd.props.pageProps.page.wayToCome),
-          nd && nd.props && nd.props.pageProps && nd.props.pageProps.initialState && nd.props.pageProps.initialState.place && (nd.props.pageProps.initialState.place.directions || nd.props.pageProps.initialState.place.wayToCome)
-        ].filter(Boolean);
-
-        out.directions = pickString(...dirCandidates, dirDom);
-
-        // address
-        const addrDom = findByLabel("주소") || "";
-        const addrCandidates = [
-          nd && nd.props && nd.props.pageProps && nd.props.pageProps.page && (nd.props.pageProps.page.address || nd.props.pageProps.page.roadAddress),
-          nd && nd.props && nd.props.pageProps && nd.props.pageProps.initialState && nd.props.pageProps.initialState.place && (nd.props.pageProps.initialState.place.address || nd.props.pageProps.initialState.place.roadAddress)
-        ].filter(Boolean);
-
-        const addrPicked = pickString(...addrCandidates, addrDom);
-        if (addrPicked) out.address = addrPicked.replace(/^주소\\s*/g, "").trim();
-
-        out.roadAddress = pickString(
-          nd && nd.props && nd.props.pageProps && nd.props.pageProps.page && nd.props.pageProps.page.roadAddress,
-          nd && nd.props && nd.props.pageProps && nd.props.pageProps.initialState && nd.props.pageProps.initialState.place && nd.props.pageProps.initialState.place.roadAddress
-        );
-
-        return out;
-      })()
-    `;
-
-    const extracted: any = await page.evaluate(homeEval);
-
-    fields.name = extracted?.name || fields.name;
-    fields.category = extracted?.category || fields.category;
-    fields.address = extracted?.address || fields.address;
-    fields.roadAddress = extracted?.roadAddress || fields.roadAddress;
-    fields.description = extracted?.description || fields.description;
-    fields.directions = extracted?.directions || fields.directions;
-
-    debug.home = {
-      nextData: !!extracted?._nextData,
-      picked: {
-        name: !!fields.name,
-        category: !!fields.category,
-        address: !!fields.address,
-        roadAddress: !!fields.roadAddress,
-        description: !!fields.description,
-        directions: !!fields.directions
-      }
+    const text = (sel: string) => {
+      const el = d?.querySelector?.(sel);
+      return (el?.textContent ?? "").trim();
     };
 
-    // PHOTO COUNT
-    if (withPhoto) {
-      const photoUrl = homeUrl.replace(/\/home(\?.*)?$/i, "/photo");
-      const t1 = Date.now();
-      try {
-        await page.goto(photoUrl, { waitUntil: "domcontentloaded", timeout: timeoutMs });
-        await page.waitForTimeout(900);
+    const attr = (sel: string, name: string) => {
+      const el = d?.querySelector?.(sel);
+      return (el?.getAttribute?.(name) ?? "").trim();
+    };
 
-        const photoEval = `
-          (() => {
-            const el = document.querySelector("#__NEXT_DATA__");
-            const txt = el && el.textContent ? el.textContent : "";
-            let nd = null;
-            if (txt) { try { nd = JSON.parse(txt); } catch { nd = null; } }
+    // meta
+    const ogDesc = attr('meta[property="og:description"]', "content") || "";
+    const metaDesc = attr('meta[name="description"]', "content") || "";
 
-            const pickNum = (...xs) => {
-              for (const v of xs) {
-                if (typeof v === "number" && Number.isFinite(v)) return v;
-              }
-              return undefined;
-            };
+    // NEXT_DATA (있으면 제일 강력)
+    let nextJsonText = "";
+    try {
+      nextJsonText = text("#__NEXT_DATA__");
+    } catch {}
 
-            const n1 = pickNum(
-              nd && nd.props && nd.props.pageProps && nd.props.pageProps.page && nd.props.pageProps.page.photoCount,
-              nd && nd.props && nd.props.pageProps && nd.props.pageProps.initialState && nd.props.pageProps.initialState.place && nd.props.pageProps.initialState.place.photoCount,
-              nd && nd.props && nd.props.pageProps && nd.props.pageProps.initialState && nd.props.pageProps.initialState.photo && nd.props.pageProps.initialState.photo.count
-            );
-            if (typeof n1 === "number") return n1;
+    // 페이지 텍스트 스냅샷(최후의 후보 탐색용)
+    let bodyText = "";
+    try {
+      bodyText = (d?.body?.innerText ?? "").slice(0, 6000);
+    } catch {}
 
-            const body = document.body && (document.body.innerText || document.body.textContent) ? (document.body.innerText || document.body.textContent) : "";
-            const m = body.match(/사진\\s*([0-9,]+)/);
-            if (m && m[1]) return parseInt(m[1].replace(/,/g, ""), 10);
-            return undefined;
-          })()
-        `;
+    // 이름/카테고리/주소/오시는길은 DOM에서 최대한 직접
+    // (Naver DOM이 자주 바뀌어서 "후보" 여러개로 둠)
+    const nameCandidates = [
+      text("h1"),
+      text('[data-testid="title"]'),
+      text(".Fc1rA"), // (가끔 쓰이는 클래스)
+    ].filter(Boolean);
 
-        const photoCount: any = await page.evaluate(photoEval);
-        if (typeof photoCount === "number") fields.photoCount = photoCount;
+    const categoryCandidates = [
+      text('[class*="category"]'),
+      text(".place_bluelink + span"),
+    ].filter(Boolean);
 
-        debug.steps.push({ step: "goto.photo", elapsedMs: Date.now() - t1, found: typeof photoCount === "number" });
-      } catch (e: any) {
-        debug.steps.push({ step: "goto.photo", elapsedMs: Date.now() - t1, error: e?.message || "photo failed" });
-      }
+    // 주소 후보: "주소" 텍스트 포함 블록 우선
+    const addrCandidates = [
+      text('div:has(span:has-text("주소"))'),
+      text('section:has(span:has-text("주소"))'),
+      text('[class*="address"]'),
+    ].filter(Boolean);
+
+    // "찾아가는길" 영역 후보
+    const dirCandidates = [
+      text('div:has-text("찾아가는길")'),
+      text('section:has-text("찾아가는길")'),
+      text('[class*="direction"]'),
+    ].filter(Boolean);
+
+    return {
+      nameCandidates,
+      categoryCandidates,
+      addrCandidates,
+      dirCandidates,
+      ogDesc,
+      metaDesc,
+      nextJsonText,
+      bodyText,
+    };
+  });
+
+  // 3) name/category/address/directions 정리
+  fields.name = pickFirstMeaningful(raw.nameCandidates);
+  fields.category = pickFirstMeaningful(raw.categoryCandidates);
+
+  // 주소는 "지도내비게이션거리뷰" 같은 붙은 쓰레기 텍스트가 섞이므로 정리
+  fields.address = cleanAddress(pickFirstMeaningful(raw.addrCandidates) || "");
+
+  // 오시는길: "찾아가는길" 헤더 같은 줄 제거 + 내용만 정리
+  fields.directions = cleanDirections(pickFirstMeaningful(raw.dirCandidates) || "");
+
+  // 4) ✅ 상세설명(소개글) — 후보 우선순위:
+  // (A) NEXT_DATA에서 description/intro 후보 탐색
+  // (B) meta/og description
+  // (C) bodyText에서 "소개" 근처 스니펫(최후)
+  const fromNext = extractIntroFromNextData(raw.nextJsonText);
+  const fromMeta = cleanDescription(raw.ogDesc || raw.metaDesc || "");
+  const fromBody = extractIntroFromBodyText(raw.bodyText);
+
+  const desc = pickFirstMeaningful([fromNext, fromMeta, fromBody].filter(Boolean));
+  fields.description = cleanDescription(desc || "");
+
+  // “리뷰 숫자 요약”만 잡힌 경우는 상세설명 없음 처리
+  if (looksLikeReviewSnippet(fields.description || "")) {
+    fields.description = "";
+  }
+
+  debug.picked = {
+    name: !!fields.name,
+    category: !!fields.category,
+    address: !!fields.address,
+    directions: !!fields.directions,
+    description: !!fields.description,
+    descriptionSource: fromNext ? "nextData" : fromMeta ? "meta" : fromBody ? "body" : "none",
+  };
+
+  debug.elapsedMs = Date.now() - t0;
+  debug.raw = {
+    ogDesc: raw.ogDesc,
+    metaDesc: raw.metaDesc,
+    hasNextData: !!raw.nextJsonText,
+  };
+
+  return { fields, debug };
+}
+
+/* ---------------- helpers ---------------- */
+
+function stripQuery(url: string) {
+  return url.replace(/\?.*$/, "");
+}
+
+function pickFirstMeaningful(arr: string[]) {
+  for (const s of arr || []) {
+    const x = (s || "").trim();
+    if (!x) continue;
+    if (x.length < 2) continue;
+    return x;
+  }
+  return "";
+}
+
+function cleanAddress(s: string) {
+  let x = (s || "").trim();
+  if (!x) return "";
+  x = x
+    .replace(/지도내비게이션거리뷰/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  // "서대문역 4번 출구에서 90m" 같은 안내문이 붙는 경우 잘라내기
+  x = x.replace(/서대문역.*?m\s*미터.*$/i, "").trim();
+  return x;
+}
+
+function cleanDirections(s: string) {
+  let x = (s || "").trim();
+  if (!x) return "";
+  x = x.replace(/^찾아가는길\s*/g, "").trim();
+  x = x.replace(/\s*\.\.\.\s*내용 더보기\s*$/g, "").trim();
+  x = x.replace(/\s+/g, " ").trim();
+  return x;
+}
+
+function cleanDescription(s: string) {
+  let x = (s || "").trim();
+  if (!x) return "";
+  x = x.replace(/\s+/g, " ").trim();
+  return x;
+}
+
+function looksLikeReviewSnippet(s: string) {
+  const x = (s || "").trim();
+  if (!x) return false;
+  // 네 로그처럼 “방문자리뷰/블로그리뷰” 스니펫은 상세설명 아님
+  return /방문자리뷰|블로그리뷰/.test(x) && x.length < 80;
+}
+
+function extractIntroFromNextData(nextJsonText: string) {
+  const t = (nextJsonText || "").trim();
+  if (!t) return "";
+
+  try {
+    const json = JSON.parse(t);
+
+    // 구조가 자주 바뀌어서 "문자열 탐색" 위주로 안전하게
+    const candidates: string[] = [];
+    const s = JSON.stringify(json);
+
+    // 흔한 키들: description, intro, introduction, summary 등
+    // 너무 길면 잘라냄
+    for (const key of ["description", "intro", "introduction", "summary", "storeDescription"]) {
+      const m = s.match(new RegExp(`"${key}"\\s*:\\s*"([^"]{10,600})"`));
+      if (m?.[1]) candidates.push(unescapeJsonString(m[1]));
     }
 
-    if (debugOn) debug.fields = fields;
-
-    return { fields, debug };
-  } finally {
-    await page.close().catch(() => {});
-    await ctx.close().catch(() => {});
-    await browser.close().catch(() => {});
+    return pickFirstMeaningful(candidates);
+  } catch {
+    return "";
   }
+}
+
+function unescapeJsonString(s: string) {
+  // JSON 문자열 escape 최소 복원
+  return (s || "")
+    .replace(/\\"/g, '"')
+    .replace(/\\n/g, "\n")
+    .replace(/\\t/g, "\t")
+    .replace(/\\u003c/g, "<")
+    .replace(/\\u003e/g, ">")
+    .replace(/\\u0026/g, "&")
+    .trim();
+}
+
+function extractIntroFromBodyText(bodyText: string) {
+  const t = (bodyText || "").trim();
+  if (!t) return "";
+
+  // “소개”라는 단어 주변에서 1~2줄 뽑기 (최후의 수단)
+  const idx = t.indexOf("소개");
+  if (idx === -1) return "";
+
+  const slice = t.slice(idx, idx + 280);
+  // 너무 잡다한 메뉴 네비 텍스트 섞이면 컷
+  if (slice.includes("리뷰") && slice.includes("사진") && slice.length < 60) return "";
+
+  return slice;
 }
