@@ -4,8 +4,6 @@ import { fetchExistingKeywordsViaPlaywright } from "./playwrightKeywords.js";
 import { fetchRepresentativeKeywords5ByFrameSource } from "./playwrightKeywordList.js";
 import { scorePlace } from "./scorePlace.js";
 import { fetchBasicFieldsViaPlaywright } from "./playwrightBasicFields.js";
-
-// ✅ 실제 export에 맞춤 (TS2724 해결)
 import { fetchCompetitorsTop } from "./playwrightCompetitors.js";
 
 type Competitor = {
@@ -23,54 +21,54 @@ type PlaceProfileLike = {
   category?: string;
   address?: string;
   roadAddress?: string;
-  description?: string; // 상세설명(소개)
-  directions?: string;  // 오시는길
+  description?: string;
+  directions?: string;
 
   tags?: string[];
-  keywords?: string[];   // 기존 대표키워드(원문 전체)
-  keywords5?: string[];  // 대표키워드 5개
+  keywords?: string[];
+  keywords5?: string[];
 
   menus?: Menu[];
   photos?: { count?: number };
+  reviews?: { count?: number };
+
   competitors?: Competitor[];
 
-  // 디버그
   _basicDebug?: any;
   _menuDebug?: any;
   _keywordDebug?: any;
   _competitorDebug?: any;
   _scoreDebug?: any;
 
-  // 확장 필드
   [k: string]: any;
 };
 
-// ✅ ctx를 optional 처리해서 analyze.ts에서 1개 인자로 호출해도 컴파일 통과 (TS2554 방어)
-export async function enrichPlace(
-  place: PlaceProfileLike,
-  ctx?: { page: any }
-): Promise<PlaceProfileLike> {
+export async function enrichPlace(place: PlaceProfileLike, ctx?: { page: any }): Promise<PlaceProfileLike> {
   const base = basePlaceUrl(place.placeUrl);
   const isHair = isHairSalon(place);
-
   const page = ctx?.page;
 
+  const empty = (s?: string) => !s || !s.trim();
+  const looksLikeReviewSnippet = (s?: string) => !!s && /(방문자리뷰|블로그리뷰)\s*\d+/i.test(s);
+
   // =========================================================
-  // 0) 기본필드(이름/주소/오시는길/상세설명) - Playwright 필요
+  // 0) 기본필드(이름/주소/오시는길/상세설명)
   // =========================================================
   if (page) {
     try {
       const homeUrl = `${base}/home`;
       const bf = await fetchBasicFieldsViaPlaywright(page, homeUrl, { timeoutMs: 15000 });
 
-      place.name = place.name || bf.fields.name;
-      place.category = place.category || bf.fields.category;
-      place.address = place.address || bf.fields.address;
-      place.roadAddress = place.roadAddress || bf.fields.roadAddress;
-      place.directions = place.directions || bf.fields.directions;
+      if (empty(place.name)) place.name = bf.fields.name;
+      if (empty(place.category)) place.category = bf.fields.category;
+      if (empty(place.address)) place.address = bf.fields.address;
+      if (empty(place.roadAddress)) place.roadAddress = bf.fields.roadAddress;
+      if (empty(place.directions)) place.directions = bf.fields.directions;
 
-      // 상세설명은 meta 스니펫일 수 있어 빈값 처리 규칙은 playwrightBasicFields에서 처리
-      place.description = place.description || bf.fields.description;
+      // ✅ 기존 description이 “리뷰 스니펫”이면 덮어쓰기 허용
+      if (empty(place.description) || looksLikeReviewSnippet(place.description)) {
+        place.description = bf.fields.description;
+      }
 
       place._basicDebug = Object.assign({}, { used: true, targetUrl: homeUrl }, bf.debug);
     } catch (e: any) {
@@ -81,26 +79,22 @@ export async function enrichPlace(
   }
 
   // =========================================================
-  // 1) 대표키워드(최우선) - frame source keywordList -> fallback
+  // 1) 대표키워드 - frame source -> fallback
   // =========================================================
   if (!place.keywords || place.keywords.length === 0) {
     const homeUrl = `${base}/home`;
 
-    // (A) frame source keywordList (page 없어도 가능하게 만들어둔 경우가 많아서 그대로 시도)
     try {
       const kw = await fetchRepresentativeKeywords5ByFrameSource(homeUrl);
-
       if (kw.raw?.length) {
         place.keywords = kw.raw.slice(0, 15);
         place.keywords5 = kw.keywords5?.length ? kw.keywords5.slice(0, 5) : kw.raw.slice(0, 5);
       }
-
       place._keywordDebug = Object.assign({}, { used: true, targetUrl: homeUrl, via: "frame-keywordList" }, kw.debug);
     } catch (e: any) {
       place._keywordDebug = { used: true, targetUrl: homeUrl, via: "frame-keywordList", error: e?.message ?? "keywordList parse failed" };
     }
 
-    // (B) fallback (Playwright 필요)
     if ((!place.keywords || place.keywords.length === 0) && page) {
       try {
         const kw2 = await fetchExistingKeywordsViaPlaywright(homeUrl);
@@ -134,11 +128,7 @@ export async function enrichPlace(
     if (page) {
       try {
         const pw = await fetchMenusViaPlaywright(priceUrl);
-
-        if (pw.menus.length) {
-          place.menus = cleanMenus(pw.menus);
-        }
-
+        if (pw.menus.length) place.menus = cleanMenus(pw.menus);
         place._menuDebug = Object.assign({}, { used: true, targetUrl: priceUrl, via: "hair-price-pw" }, pw.debug);
       } catch (e: any) {
         place._menuDebug = { used: true, targetUrl: priceUrl, via: "hair-price-pw", error: e?.message ?? "price pw failed" };
@@ -149,16 +139,12 @@ export async function enrichPlace(
   }
 
   // =========================================================
-  // 3) 경쟁사 Top5 (키워드 5개씩) - Playwright 필요
+  // 3) 경쟁사 Top5 (유료 핵심) - 다음 카테고리에서 “query [object Object]” 고침
   // =========================================================
   if (page) {
     try {
       const query = buildCompetitorQuery(place);
-
-      // ✅ 기존 코드가 fetchCompetitorsTop5를 쓰고 있었으니,
-      //    여기서 호환 래퍼로 해결 (import/export 불일치 TS2724 방어)
-      const res = await fetchCompetitorsTop5(page, { query, limit: 5, excludePlaceId: place.placeId });
-
+      const res = await fetchCompetitorsTop(page, { query, limit: 5, excludePlaceId: place.placeId } as any);
       place.competitors = res.competitors || [];
       place._competitorDebug = res.debug || { used: true, query, limit: 5 };
     } catch (e: any) {
@@ -178,18 +164,6 @@ export async function enrichPlace(
   }
 
   return place;
-}
-
-/* ---------------- compat wrapper ---------------- */
-
-// ✅ fetchCompetitorsTop만 있는 프로젝트에서도 기존 코드 형태(fetchCompetitorsTop5) 유지 가능
-async function fetchCompetitorsTop5(
-  page: any,
-  opts: { query: string; limit?: number; excludePlaceId?: string }
-): Promise<{ competitors?: Competitor[]; debug?: any }> {
-  // fetchCompetitorsTop의 시그니처가 (page, opts) 형태라고 가정(너 에러 메시지가 이 구조를 강하게 시사)
-  // 만약 내부 시그니처가 다르면 여기만 고치면 전체가 살아남.
-  return fetchCompetitorsTop(page, { ...opts, limit: opts.limit ?? 5 });
 }
 
 /* ---------------- helpers ---------------- */
