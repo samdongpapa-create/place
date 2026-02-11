@@ -11,6 +11,15 @@ export type BasicFieldsResult = {
   debug: any;
 };
 
+type BasicFieldsEvalResult = {
+  name: string;
+  category: string;
+  address: string;
+  roadAddress: string;
+  directions: string;
+  photoCount: number | null;
+};
+
 const UA_MOBILE =
   "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
 
@@ -83,14 +92,14 @@ export async function fetchBasicFieldsViaPlaywright(homeUrl: string): Promise<Ba
     `;
 
     // @ts-ignore - 문자열 함수 실행 (TS가 내부 파싱 안 함)
-    const data = await page.evaluate(eval(fn));
+    const data = (await page.evaluate(eval(fn))) as BasicFieldsEvalResult;
 
     return {
-      name: data?.name || undefined,
-      category: data?.category || undefined,
-      address: data?.address || undefined,
-      roadAddress: data?.roadAddress || undefined,
-      directions: data?.directions || undefined,
+      name: data?.name ? data.name : undefined,
+      category: data?.category ? data.category : undefined,
+      address: data?.address ? data.address : undefined,
+      roadAddress: data?.roadAddress ? data.roadAddress : undefined,
+      directions: data?.directions ? data.directions : undefined,
       photoCount: typeof data?.photoCount === "number" ? data.photoCount : undefined,
       debug: { used: true, targetUrl: homeUrl, elapsedMs: Date.now() - started }
     };
