@@ -1,18 +1,20 @@
+# --- base ---
 FROM node:20-slim
 
 WORKDIR /app
 
-# package 먼저 복사
+# 1) deps 먼저
 COPY package*.json ./
 
-RUN npm ci
+# ✅ lock mismatch면 ci가 터지니까 install로 간다
+RUN npm install
 
-# 전체 복사 (public 포함)
+# 2) 소스 전체 복사 (public 포함)
 COPY . .
 
-# 타입스크립트 빌드
+# 3) 빌드
 RUN npm run build
 
-EXPOSE 3000
-
+# 4) 실행
+EXPOSE 8080
 CMD ["npm", "start"]
