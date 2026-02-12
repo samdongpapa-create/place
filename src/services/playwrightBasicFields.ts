@@ -26,7 +26,7 @@ export async function fetchBasicFieldsViaPlaywright(
   opts: Opts = {}
 ): Promise<BasicFieldsResult> {
   const t0 = Date.now();
-  const timeoutMs = opts.timeoutMs ?? 20000;
+  const timeoutMs = opts.timeoutMs ?? 22000;
 
   const debug: any = {
     used: true,
@@ -39,48 +39,63 @@ export async function fetchBasicFieldsViaPlaywright(
   const fields: BasicFields = {};
   const step = (s: any) => debug.steps.push({ at: Date.now() - t0, ...s });
 
-  // 1) HOME 진입
   await page.goto(homeUrl, { waitUntil: "domcontentloaded", timeout: timeoutMs });
   step({ step: "goto.home" });
 
-  // 렌더 안정화
   await page.waitForTimeout(900);
   step({ step: "wait.900" });
 
-  // =========================================================
-  // ✅ 카테고리 7 핵심: 스크롤/더보기 클릭으로 숨은 텍스트 로딩
-  // =========================================================
+  // 1) warmup (스크롤/더보기)
   await warmUpForHiddenSections(page, debug);
   step({ step: "warmup.done" });
 
-  // 2) 수집(1차)
+  // 2) 수집 1차
   let raw = await collect(page);
   step({ step: "collect.1", snapshot: summarizeRaw(raw) });
 
-  // 3) 소개/오시는길이 비어있으면 더 강하게 클릭/스크롤 후 재수집
-  const needMore =
-    !pickFirstMeaningful(raw.descCandidates) ||
-    !pickFirstMeaningful(raw.dirCandidates);
+  // 3) 주소/오시는길이 비면 "지도/길찾기/오시는길" 클릭 시도 후 재수집
+  const needAddress = !pickFirstMeaningful(raw.addrCandidates);
+  const needDir = !pickFirstMeaningful(raw.dirCandidates);
 
-  if (needMore) {
+  if (needAddress || needDir) {
+    await tryOpenDirectionsLayer(page, debug);
+    await page.waitForTimeout(650);
+    raw = await collect(page);
+    step({ step: "collect.after.openDirections", snapshot: summarizeRaw(raw) });
+  }
+
+  // 4) 그래도 비면 strong warmup 한 번 더
+  const stillNeed =
+    !pickFirstMeaningful(raw.addrCandidates) || !pickFirstMeaningful(raw.dirCandidates);
+
+  if (stillNeed) {
     await warmUpForHiddenSections(page, debug, true);
     step({ step: "warmup.strong.done" });
-
     raw = await collect(page);
     step({ step: "collect.2", snapshot: summarizeRaw(raw) });
   }
 
-  // 4) 필드 정리
+  // =========================
+  // 필드 정리
+  // =========================
   fields.name = pickFirstMeaningful(raw.nameCandidates);
   fields.category = cleanCategory(pickFirstMeaningful(raw.categoryCandidates));
 
-  const addr = pickFirstMeaningful(raw.addrCandidates) || "";
-  fields.address = cleanAddress(addr);
+  // ✅ 주소: DOM 후보 -> ld+json -> body 정규식
+  const addrFromDom = cleanAddress(pickFirstMeaningful(raw.addrCandidates) || "");
+  const addrFromLd = cleanAddress(extractAddressFromLdJson(raw.ldJsonText) || "");
+  const addrFromBody = cleanAddress(extractKoreanAddressFromText(raw.bodyText) || "");
+  fields.address = pickFirstMeaningful([addrFromDom, addrFromLd, addrFromBody].filter(Boolean));
 
-  const dir = pickFirstMeaningful(raw.dirCandidates) || "";
-  fields.directions = cleanDirections(dir);
+  // 도로명은 ldjson에 따로 있을 수 있음
+  fields.roadAddress = cleanAddress(extractRoadAddressFromLdJson(raw.ldJsonText) || "");
 
-  // 소개/상세설명 우선순위: DOM 후보 -> NEXT_DATA -> meta -> body
+  // ✅ 오시는길: DOM 후보 -> body에서 “출구/도보/주차” 포함 문장 추출
+  const dirFromDom = cleanDirections(pickFirstMeaningful(raw.dirCandidates) || "");
+  const dirFromBody = cleanDirections(extractDirectionsFromText(raw.bodyText) || "");
+  fields.directions = pickFirstMeaningful([dirFromDom, dirFromBody].filter(Boolean));
+
+  // ✅ 소개/상세설명: DOM 후보 -> NEXT_DATA -> meta -> body
   const fromDom = cleanDescription(pickFirstMeaningful(raw.descCandidates) || "");
   const fromNext = extractIntroFromNextData(raw.nextJsonText);
   const fromMeta = cleanDescription(raw.ogDesc || raw.metaDesc || "");
@@ -89,13 +104,16 @@ export async function fetchBasicFieldsViaPlaywright(
   const desc = pickFirstMeaningful([fromDom, fromNext, fromMeta, fromBody].filter(Boolean));
   fields.description = cleanDescription(desc || "");
 
-  // “리뷰 스니펫”이면 상세설명 아님 처리
+  // “접기” 제거(너 결과에 붙어있었음)
+  if (fields.description) fields.description = fields.description.replace(/접기\s*$/g, "").trim();
+
   if (looksLikeReviewSnippet(fields.description || "")) fields.description = "";
 
   debug.picked = {
     name: !!fields.name,
     category: !!fields.category,
     address: !!fields.address,
+    roadAddress: !!fields.roadAddress,
     directions: !!fields.directions,
     description: !!fields.description,
     descriptionSource: fromDom ? "dom" : fromNext ? "nextData" : fromMeta ? "meta" : fromBody ? "body" : "none",
@@ -106,32 +124,28 @@ export async function fetchBasicFieldsViaPlaywright(
     ogDesc: raw.ogDesc,
     metaDesc: raw.metaDesc,
     hasNextData: !!raw.nextJsonText,
+    hasLdJson: !!raw.ldJsonText,
   };
 
   return { fields, debug };
 }
 
 /* =========================================================
- * ✅ 액션: 스크롤 + 더보기 클릭
+ * 액션: 스크롤 + 더보기 클릭
  * ========================================================= */
 
 async function warmUpForHiddenSections(page: Page, debug: any, strong = false) {
   const t = Date.now();
   const act = (a: any) => debug.actions.push({ at: Date.now() - t, ...a });
 
-  // 모바일 페이지는 스크롤하면서 섹션이 늦게 로딩되는 경우가 많음
   await scrollPage(page, strong ? 6 : 4, act);
+  await clickMoreButtons(page, act, strong ? 7 : 3);
 
-  // "더보기"가 섞여있으면 일단 여러 번 눌러서 텍스트를 펼침
-  await clickMoreButtons(page, act, strong ? 6 : 3);
-
-  // 탭/섹션 전환이 필요한 케이스 대비: "정보" 또는 "홈" 내부 정보 더보기 시도
-  // (없으면 조용히 스킵)
+  // "정보" 탭 있으면 한 번 눌러주기
   await tryClickByText(page, ["정보", "매장정보", "가게정보"], act);
 
-  // 다시 한 번 스크롤/더보기
   await scrollPage(page, strong ? 4 : 2, act);
-  await clickMoreButtons(page, act, strong ? 6 : 2);
+  await clickMoreButtons(page, act, strong ? 7 : 2);
 
   act({ step: "warmup.finish", strong });
 }
@@ -150,20 +164,15 @@ async function scrollPage(page: Page, times: number, act: (a: any) => void) {
 }
 
 async function clickMoreButtons(page: Page, act: (a: any) => void, maxClicks: number) {
-  let clicked = 0;
-
   for (let i = 0; i < maxClicks; i++) {
     try {
-      // Playwright text 엔진은 locator에서 사용 가능 (evaluate의 querySelector와 다름)
       const btn = page.getByRole("button", { name: /더보기|펼쳐보기|자세히보기/i }).first();
       const count = await btn.count();
       if (!count) break;
 
       await btn.click({ timeout: 1500 });
       await page.waitForTimeout(450);
-
-      clicked++;
-      act({ step: "click.more", clicked });
+      act({ step: "click.more", clicked: i + 1 });
     } catch (e: any) {
       act({ step: "click.more.fail", error: e?.message ?? String(e) });
       break;
@@ -189,7 +198,56 @@ async function tryClickByText(page: Page, labels: string[], act: (a: any) => voi
 }
 
 /* =========================================================
- * ✅ 수집 로직 (evaluate는 “순수 querySelector 기반”만 사용)
+ * ✅ 오시는길/지도 레이어 열기 시도 (핵심)
+ * ========================================================= */
+async function tryOpenDirectionsLayer(page: Page, debug: any) {
+  const t = Date.now();
+  const act = (a: any) => debug.actions.push({ at: Date.now() - t, ...a });
+
+  // 모바일 네이버플레이스에서 흔히 보이는 텍스트/버튼들
+  const tries = [
+    "오시는길",
+    "찾아오는길",
+    "길찾기",
+    "지도",
+    "위치",
+    "주차",
+  ];
+
+  for (const label of tries) {
+    try {
+      const el = page.getByText(label, { exact: false }).first();
+      const n = await el.count();
+      if (!n) continue;
+
+      await el.click({ timeout: 1500 });
+      await page.waitForTimeout(600);
+      act({ step: "open.directions.click", label, ok: true });
+      return;
+    } catch (e: any) {
+      act({ step: "open.directions.fail", label, error: e?.message ?? String(e) });
+    }
+  }
+
+  // 버튼 role 기반도 한 번 더
+  try {
+    const btn = page.getByRole("button", { name: /길찾기|오시는길|지도/i }).first();
+    const n = await btn.count();
+    if (n) {
+      await btn.click({ timeout: 1500 });
+      await page.waitForTimeout(600);
+      act({ step: "open.directions.roleButton", ok: true });
+      return;
+    }
+  } catch (e: any) {
+    act({ step: "open.directions.roleButton.fail", error: e?.message ?? String(e) });
+  }
+
+  act({ step: "open.directions.skip" });
+}
+
+/* =========================================================
+ * 수집 로직
  * ========================================================= */
 
 async function collect(page: Page) {
@@ -219,26 +277,31 @@ async function collect(page: Page) {
       nextJsonText = text("#__NEXT_DATA__");
     } catch {}
 
+    // ld+json (주소 들어있는 경우 많음)
+    let ldJsonText = "";
+    try {
+      const nodes = Array.from(d.querySelectorAll('script[type="application/ld+json"]'));
+      ldJsonText = nodes.map((n: any) => (n?.textContent ?? "").trim()).filter(Boolean).join("\n");
+    } catch {}
+
     // body snapshot
     let bodyText = "";
     try {
-      bodyText = (d?.body?.innerText ?? "").slice(0, 12000);
+      bodyText = (d?.body?.innerText ?? "").slice(0, 20000);
     } catch {}
 
-    // label 근처 값 뽑기(소개/오시는길/주소 등)
+    // label 근처 값 뽑기
     const pickNearLabel = (label: string) => {
-      const all = Array.from(d.querySelectorAll("dt, span, div, strong, em, h1, h2, h3, p"));
+      const all = Array.from(d.querySelectorAll("dt, span, div, strong, em, h1, h2, h3, p, a, button"));
       const hit = all.find((el: any) => textOf(el) === label);
       if (!hit) return "";
 
-      // dt -> dd 패턴
       if ((hit as any).tagName?.toLowerCase() === "dt") {
         const dd = (hit as any).nextElementSibling;
         const v = textOf(dd);
         if (v) return v;
       }
 
-      // 같은 부모의 다음 형제
       const parent = (hit as any).parentElement;
       if (parent) {
         const children = Array.from(parent.children);
@@ -249,9 +312,8 @@ async function collect(page: Page) {
         }
       }
 
-      // 다음 요소 몇 개 탐색
       let cur: any = hit;
-      for (let i = 0; i < 10; i++) {
+      for (let i = 0; i < 12; i++) {
         const next = cur?.nextElementSibling;
         const v = textOf(next);
         if (v) return v;
@@ -265,33 +327,33 @@ async function collect(page: Page) {
     const nameCandidates = [
       text("h1"),
       text('[data-testid="title"]'),
-      text(".Fc1rA")
+      text(".Fc1rA"),
     ].filter(Boolean);
 
-    // 카테고리는 제목 근처 span/div에서 후보 뽑기
     const categoryCandidates = [
       text("h1 + div"),
       text("h1 + span"),
-      text('[class*="category"]')
+      text('[class*="category"]'),
     ].filter(Boolean);
 
     const addrCandidates = [
       pickNearLabel("주소"),
       pickNearLabel("위치"),
       pickNearLabel("도로명주소"),
-      text('[class*="address"]')
+      text('[class*="address"]'),
     ].filter(Boolean);
 
     const dirCandidates = [
       pickNearLabel("오시는길"),
       pickNearLabel("찾아오는길"),
-      pickNearLabel("길안내")
+      pickNearLabel("길안내"),
+      pickNearLabel("주차"),
     ].filter(Boolean);
 
     const descCandidates = [
       pickNearLabel("소개"),
       pickNearLabel("상세설명"),
-      pickNearLabel("매장소개")
+      pickNearLabel("매장소개"),
     ].filter(Boolean);
 
     return {
@@ -303,13 +365,14 @@ async function collect(page: Page) {
       ogDesc,
       metaDesc,
       nextJsonText,
-      bodyText
+      ldJsonText,
+      bodyText,
     };
   });
 }
 
 function summarizeRaw(raw: any) {
-  const pick = (arr: any[]) => (Array.isArray(arr) && arr.length ? String(arr[0]).slice(0, 40) : "");
+  const pick = (arr: any[]) => (Array.isArray(arr) && arr.length ? String(arr[0]).slice(0, 60) : "");
   return {
     name: pick(raw?.nameCandidates),
     category: pick(raw?.categoryCandidates),
@@ -317,6 +380,7 @@ function summarizeRaw(raw: any) {
     dir: pick(raw?.dirCandidates),
     desc: pick(raw?.descCandidates),
     hasNext: !!raw?.nextJsonText,
+    hasLd: !!raw?.ldJsonText,
     ogDesc: (raw?.ogDesc || "").slice(0, 40),
   };
 }
@@ -340,10 +404,8 @@ function pickFirstMeaningful(arr: string[]) {
 function cleanCategory(s: string) {
   let x = (s || "").trim();
   if (!x) return "";
-  // 너무 길면 잘라내기(가끔 부가 텍스트까지 붙음)
   x = x.replace(/\s+/g, " ").trim();
   if (x.length > 40) x = x.slice(0, 40).trim();
-  // 카테고리에 리뷰/별점 섞이면 제거
   x = x.replace(/방문자리뷰.*$/g, "").trim();
   return x;
 }
@@ -353,14 +415,14 @@ function cleanAddress(s: string) {
   if (!x) return "";
 
   x = x.replace(/지도내비게이션거리뷰/g, " ").replace(/\s+/g, " ").trim();
-
-  // "2층 5서대문역" 처럼 붙는 경우 → 숫자/한글 경계 띄우기
   x = x.replace(/(\d)([가-힣])/g, "$1 $2");
 
-  // "서대문역 4번 출구에서 90m미터" 같은 안내 문구 제거
+  // 역/거리 안내 제거
   x = x.replace(/서대문역.*?(m|미터).*$/i, "").trim();
   x = x.replace(/(\d+)\s*m\s*.*$/i, "").trim();
 
+  // 너무 짧으면 무효
+  if (x.length < 6) return "";
   return x;
 }
 
@@ -370,7 +432,6 @@ function cleanDirections(s: string) {
   x = x.replace(/^찾아가는길\s*/g, "").trim();
   x = x.replace(/\s*\.\.\.\s*내용 더보기\s*$/g, "").trim();
   x = x.replace(/\s+/g, " ").trim();
-  // 너무 짧으면 사실상 없음 처리
   if (x.length < 6) return "";
   return x;
 }
@@ -387,6 +448,66 @@ function looksLikeReviewSnippet(s: string) {
   const x = (s || "").trim();
   if (!x) return false;
   return /방문자리뷰|블로그리뷰/.test(x) && x.length < 80;
+}
+
+// ✅ ld+json에서 address 꺼내기
+function extractAddressFromLdJson(ldJsonText: string) {
+  const t = (ldJsonText || "").trim();
+  if (!t) return "";
+  try {
+    // 여러 개일 수 있어서 대충 문자열 탐색
+    const s = t;
+    // addressLocality / streetAddress 조합
+    const m1 = s.match(/"streetAddress"\s*:\s*"([^"]{4,200})"/);
+    const m2 = s.match(/"addressLocality"\s*:\s*"([^"]{2,100})"/);
+    const m3 = s.match(/"addressRegion"\s*:\s*"([^"]{2,100})"/);
+
+    const parts = [m3?.[1], m2?.[1], m1?.[1]].filter(Boolean);
+    return parts.join(" ").trim();
+  } catch {
+    return "";
+  }
+}
+
+// ✅ ld+json에서 도로명만 따로
+function extractRoadAddressFromLdJson(ldJsonText: string) {
+  const t = (ldJsonText || "").trim();
+  if (!t) return "";
+  try {
+    const m = t.match(/"streetAddress"\s*:\s*"([^"]{4,200})"/);
+    return m?.[1] ? m[1].trim() : "";
+  } catch {
+    return "";
+  }
+}
+
+// ✅ bodyText에서 한국 주소 정규식 추출
+function extractKoreanAddressFromText(bodyText: string) {
+  const t = (bodyText || "").replace(/\s+/g, " ").trim();
+  if (!t) return "";
+
+  // “서울 종로구 새문안로 15-1” 같은 형태
+  const re =
+    /(서울|부산|대구|인천|광주|대전|울산|세종|경기|강원|충북|충남|전북|전남|경북|경남|제주)\s*[가-힣0-9\s]+?(구|군|시)\s*[가-힣0-9\s]+?(로|길)\s*\d{1,4}(-\d{1,4})?/;
+
+  const m = t.match(re);
+  return m?.[0] ? m[0].trim() : "";
+}
+
+// ✅ bodyText에서 오시는길 문장 추출(출구/도보/주차 키워드)
+function extractDirectionsFromText(bodyText: string) {
+  const t = (bodyText || "").replace(/\s+/g, " ").trim();
+  if (!t) return "";
+
+  const keys = ["출구", "도보", "주차", "가까", "m", "미터", "분"];
+  for (const k of keys) {
+    const idx = t.indexOf(k);
+    if (idx > -1) {
+      const slice = t.slice(Math.max(0, idx - 30), idx + 120);
+      if (slice.length >= 12) return slice.trim();
+    }
+  }
+  return "";
 }
 
 function extractIntroFromNextData(nextJsonText: string) {
@@ -424,7 +545,6 @@ function extractIntroFromBodyText(bodyText: string) {
   const t = (bodyText || "").trim();
   if (!t) return "";
 
-  // “소개” 주변 스니펫 (최후의 수단)
   const idx = t.indexOf("소개");
   if (idx === -1) return "";
 
@@ -433,3 +553,4 @@ function extractIntroFromBodyText(bodyText: string) {
 
   return slice;
 }
+
