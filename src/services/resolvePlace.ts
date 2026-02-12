@@ -1,29 +1,47 @@
-function extractPlaceIdFromNaverMapUrl(url: string): string | null {
-  const u = (url || "").trim();
+// src/services/resolvePlace.ts
 
-  // 예: https://map.naver.com/p/entry/place/1443688242
-  // 예: https://map.naver.com/v5/entry/place/1443688242
-  let m = u.match(/\/entry\/place\/(\d+)/);
+export type ResolvedPlace = {
+  placeId: string | null;
+  placeUrl: string;
+  confidence: number;
+};
+
+export async function resolvePlace(input: any, _options?: any): Promise<ResolvedPlace> {
+  const rawUrl: string = input?.placeUrl || input?.url || input?.value || "";
+
+  const placeId = extractPlaceId(rawUrl);
+
+  if (placeId) {
+    return {
+      placeId,
+      placeUrl: `https://m.place.naver.com/place/${placeId}/home`,
+      confidence: 1.0
+    };
+  }
+
+  // placeId를 못 찾으면, 일단 입력 URL을 그대로 던지되 confidence 낮게
+  // (원하면 여기서 "throw"로 강제 실패로 바꿔도 됨)
+  return {
+    placeId: null,
+    placeUrl: rawUrl,
+    confidence: 0.2
+  };
+}
+
+function extractPlaceId(url: string): string | null {
+  if (!url) return null;
+
+  let m = url.match(/\/entry\/place\/(\d+)/);
   if (m?.[1]) return m[1];
 
-  m = u.match(/\/v5\/entry\/place\/(\d+)/);
+  m = url.match(/\/v5\/entry\/place\/(\d+)/);
   if (m?.[1]) return m[1];
 
-  // 혹시 query에 들어오는 케이스 방어
-  m = u.match(/[?&]placeId=(\d+)/i);
+  m = url.match(/\/place\/(\d+)/);
+  if (m?.[1]) return m[1];
+
+  m = url.match(/[?&]placeId=(\d+)/i);
   if (m?.[1]) return m[1];
 
   return null;
-}
-
-// resolvePlace 내부에서, input이 URL일 때 최우선으로 처리
-function normalizeToMobilePlaceHome(url: string): { placeId: string; placeUrl: string } | null {
-  const placeId = extractPlaceIdFromNaverMapUrl(url);
-  if (!placeId) return null;
-
-  // ✅ map 페이지를 긁지 말고 m.place로 직행
-  return {
-    placeId,
-    placeUrl: `https://m.place.naver.com/place/${placeId}/home`,
-  };
 }
