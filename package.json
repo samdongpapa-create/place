@@ -3,11 +3,12 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "scripts": {
-    "dev": "tsx watch src/index.ts",
-    "build": "tsc -p tsconfig.json",
-    "start": "node dist/index.js"
-  },
+"scripts": {
+  "dev": "ts-node src/index.ts",
+  "build": "tsc -p tsconfig.json",
+  "start": "node dist/index.js"
+}
+
   "dependencies": {
     "cheerio": "^1.0.0",
     "express": "^4.19.2",
