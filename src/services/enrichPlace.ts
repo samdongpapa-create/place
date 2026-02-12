@@ -308,12 +308,26 @@ function basePlaceUrl(url: string) {
   return url.replace(/\/(home|photo|review|price|menu|booking)(\?.*)?$/i, "");
 }
 
-function buildCompetitorQuery(place: PlaceProfileLike) {
+function buildCompetitorQuery(place: any) {
+  const name = (place.name || "").toString();
   const addr = (place.address || "").toString();
+
+  // ✅ 주소가 비어도 “서대문역점” 같은 지점명이 있으면 역 키워드로 고정
+  if (name.includes("서대문역")) return "서대문역 미용실";
+  if (name.includes("광화문")) return "광화문 미용실";
+  if (name.includes("시청")) return "시청 미용실";
+  if (name.includes("종로")) return "종로 미용실";
+
+  // ✅ 주소 기반
   if (addr.includes("서대문역")) return "서대문역 미용실";
+  if (addr.includes("광화문")) return "광화문 미용실";
+  if (addr.includes("시청")) return "시청 미용실";
   if (addr.includes("종로구")) return "종로구 미용실";
-  return `${place.name || ""} 미용실`.trim() || "미용실";
+
+  // fallback
+  return "서대문역 미용실";
 }
+
 
 function looksLikeParkingFee(name: string) {
   const x = name.toLowerCase();
