@@ -31,6 +31,9 @@ analyzeRouter.post("/analyze", async (req, res) => {
   const { input, options } = parsed.data;
   const requestId = `req_${Date.now().toString(36)}`;
 
+  // ✅ debug 노출 여부: options.debug 같은 거 쓰지 말고 depth로 제어
+  const includeDebug = options.depth === "deep";
+
   const debug: any = {
     resolved: {},
     home: {},
@@ -42,6 +45,7 @@ analyzeRouter.post("/analyze", async (req, res) => {
   let page: any = null;
 
   try {
+    // 1) resolve
     const resolved = await resolvePlace(input as any, options as any);
     debug.resolved = {
       placeUrl: resolved.placeUrl,
@@ -49,6 +53,7 @@ analyzeRouter.post("/analyze", async (req, res) => {
       placeId: resolved.placeId ?? null
     };
 
+    // 2) HTML fetch
     const fetchedHome = await fetchPlaceHtml(resolved.placeUrl, {
       minLength: 120,
       retries: 1,
@@ -69,9 +74,10 @@ analyzeRouter.post("/analyze", async (req, res) => {
       placeUrl: fetchedHome.finalUrl
     }) as any;
 
-    // price probe (판정용)
+    // 3) price probe (판정용)
     try {
       const placeId = place?.placeId || resolved.placeId;
+
       const priceUrl = placeId
         ? `https://m.place.naver.com/hairshop/${placeId}/price`
         : `${(resolved.placeUrl || "").replace(
@@ -96,8 +102,9 @@ analyzeRouter.post("/analyze", async (req, res) => {
       debug.priceProbe = { error: e?.message ?? String(e) };
     }
 
-    // Playwright
+    // 4) Playwright (상용화 핵심)
     const t0 = Date.now();
+
     browser = await chromium.launch({
       headless: true,
       args: [
@@ -124,20 +131,23 @@ analyzeRouter.post("/analyze", async (req, res) => {
     page = await context.newPage();
 
     debug.playwright = { used: true, headless: true };
+
+    // ✅ enrichPlace에 page 전달
     place = await enrichPlace(place, { page });
+
     debug.playwright.elapsedMs = Date.now() - t0;
 
-    // 점수/추천
+    // 5) 점수 + 추천
     const industry = autoClassifyIndustry(place);
     const scores = scorePlace(place, industry.vertical);
     const recommendRaw = recommendForPlace(place, scores, industry.subcategory);
     const recommend = applyPlanToRecommend(options.plan, recommendRaw);
 
-    // ✅ 여기서 "상용화용 슬림 응답"으로 변환
-    const safe = pruneForClient({ place, scores, recommend, debug }, {
-      plan: options.plan,
-      includeDebug: !!options.debug // 디버그 옵션 있을 때만 원본 debug 크게 내려줌
-    });
+    // ✅ 응답 슬림화(상용화용)
+    const safe = pruneForClient(
+      { place, scores, recommend, debug },
+      { plan: options.plan, includeDebug }
+    );
 
     return res.json({
       meta: {
@@ -163,8 +173,12 @@ analyzeRouter.post("/analyze", async (req, res) => {
       debug
     });
   } finally {
-    try { if (page) await page.close(); } catch {}
-    try { if (browser) await browser.close(); } catch {}
+    try {
+      if (page) await page.close();
+    } catch {}
+    try {
+      if (browser) await browser.close();
+    } catch {}
   }
 });
 
@@ -178,7 +192,6 @@ function pruneForClient(
 ) {
   const { place, scores, recommend, debug } = payload;
 
-  // 1) place는 필요한 키만 남기기
   const placeOut: any = {
     placeId: place.placeId,
     placeUrl: stripQuery(place.placeUrl),
@@ -189,9 +202,7 @@ function pruneForClient(
     description: place.description,
     directions: place.directions,
     keywords5: Array.isArray(place.keywords5) ? place.keywords5.slice(0, 5) : [],
-    // 상용화에서 메뉴는 보여줄지 말지 선택 (일단 20개 제한)
     menus: Array.isArray(place.menus) ? place.menus.slice(0, 20) : [],
-    // 경쟁사는 PRO에서만
     competitors:
       opts.plan === "pro" && Array.isArray(place.competitors)
         ? place.competitors.slice(0, 5).map((c: any) => ({
@@ -202,24 +213,20 @@ function pruneForClient(
         : []
   };
 
-  // 2) 추천도 과한 덩어리 제거 (필요한 블록만)
   const recOut: any = {
     keywords5: recommend?.keywords5 ?? [],
     todoTop5: recommend?.todoTop5 ?? [],
     rewrite: recommend?.rewrite ?? {}
   };
 
-  // 3) scores는 그대로 OK (가볍다)
   const scoresOut = scores;
 
-  // 4) debug는 기본 OFF, 켜면 “핵심만” (raw bodyText 같은 거 내려주지마)
   const debugOut = opts.includeDebug
     ? {
         resolved: debug?.resolved,
         home: debug?.home,
         priceProbe: debug?.priceProbe,
         playwright: debug?.playwright,
-        // 내부 디버그도 raw 통째로 말고 요약만
         basic: slimDebug(place?._basicDebug),
         keyword: slimDebug(place?._keywordDebug),
         menu: slimDebug(place?._menuDebug),
@@ -232,7 +239,6 @@ function pruneForClient(
 
 function slimDebug(d: any) {
   if (!d) return null;
-  // raw/bodyText/nextJson 같은 초대형 키 제거
   const { raw, bodyText, nextJsonText, ...rest } = d;
   return rest;
 }
@@ -240,4 +246,3 @@ function slimDebug(d: any) {
 function stripQuery(url: string) {
   return (url || "").replace(/\?.*$/, "");
 }
-
