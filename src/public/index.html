@@ -1,0 +1,336 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>네이버 플레이스 진단</title>
+    <style>
+      :root { --bg:#f6f7fb; --card:#fff; --text:#0f172a; --muted:#64748b; --line:#e2e8f0; --primary:#2563eb; --good:#16a34a; --warn:#f59e0b; --bad:#ef4444; }
+      *{box-sizing:border-box}
+      body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Pretendard,Apple SD Gothic Neo,Arial,sans-serif;background:var(--bg);color:var(--text)}
+      .wrap{max-width:980px;margin:28px auto;padding:0 16px}
+      .top{display:flex;align-items:center;gap:10px;margin-bottom:14px}
+      .badge{display:inline-flex;align-items:center;gap:8px;background:#eef2ff;color:#1e40af;padding:8px 10px;border-radius:999px;font-weight:700}
+      .grid{display:grid;grid-template-columns:1.4fr .6fr .4fr;gap:10px}
+      .card{background:var(--card);border:1px solid var(--line);border-radius:14px;box-shadow:0 6px 18px rgba(15,23,42,.04)}
+      .card.pad{padding:14px}
+      label{display:block;font-size:12px;color:var(--muted);margin-bottom:6px}
+      input,select,button,textarea{font:inherit}
+      input,select{width:100%;padding:12px 12px;border:1px solid var(--line);border-radius:12px;background:#fff}
+      button{width:100%;padding:12px 12px;border:0;border-radius:12px;background:var(--primary);color:#fff;font-weight:800;cursor:pointer}
+      button:disabled{opacity:.6;cursor:not-allowed}
+      .row{display:flex;gap:10px;flex-wrap:wrap}
+      .pill{display:inline-flex;gap:8px;align-items:center;border:1px solid var(--line);background:#fff;padding:8px 10px;border-radius:999px;color:var(--muted);font-size:12px}
+      .sectionTitle{display:flex;align-items:center;justify-content:space-between;margin:18px 2px 10px}
+      .sectionTitle h2{margin:0;font-size:16px}
+      .muted{color:var(--muted);font-size:12px}
+      .kpi{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+      .kpi .box{padding:14px;border-radius:14px;border:1px solid var(--line);background:#fff}
+      .kpi .t{font-size:12px;color:var(--muted)}
+      .kpi .v{font-size:22px;font-weight:900;margin-top:4px}
+      .grade{display:inline-flex;align-items:center;justify-content:center;min-width:44px;height:30px;border-radius:999px;font-weight:900;color:#fff}
+      .grade.A{background:var(--good)} .grade.B{background:#22c55e}
+      .grade.C{background:var(--warn)} .grade.D{background:#fb923c}
+      .grade.F{background:var(--bad)}
+      .two{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+      .list{display:flex;flex-direction:column;gap:8px}
+      .item{border:1px solid var(--line);border-radius:14px;background:#fff;padding:12px}
+      .itemTop{display:flex;align-items:center;justify-content:space-between;gap:10px}
+      .itemTop b{font-size:14px}
+      .itemTop span{font-size:12px;color:var(--muted)}
+      .bar{height:10px;background:#eef2ff;border-radius:999px;overflow:hidden;margin-top:8px}
+      .bar>i{display:block;height:100%;background:var(--primary);width:0%}
+      .chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+      .chip{border:1px solid var(--line);background:#fff;border-radius:999px;padding:7px 10px;font-size:12px}
+      .textbox{border:1px solid var(--line);background:#fff;border-radius:14px;padding:12px;white-space:pre-wrap;line-height:1.55}
+      .actions{display:flex;gap:8px;margin-top:10px}
+      .btn2{flex:0 0 auto;padding:10px 12px;border-radius:12px;border:1px solid var(--line);background:#fff;color:var(--text);font-weight:800;cursor:pointer}
+      .btn2.primary{background:var(--primary);border-color:var(--primary);color:#fff}
+      details{border:1px dashed var(--line);border-radius:14px;padding:10px;background:#fff}
+      summary{cursor:pointer;font-weight:800}
+      pre{white-space:pre-wrap;word-break:break-word;margin:10px 0 0;font-size:12px;color:#0b1220}
+      @media (max-width:880px){.grid{grid-template-columns:1fr}.kpi{grid-template-columns:repeat(2,1fr)}.two{grid-template-columns:1fr}}
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="top">
+        <div class="badge">🧪 네이버 플레이스 진단</div>
+        <div class="pill">무료: 점수/등급</div>
+        <div class="pill">PRO: 경쟁사키워드 + 복붙본</div>
+      </div>
+
+      <div class="card pad">
+        <div class="grid">
+          <div>
+            <label>네이버 플레이스 URL</label>
+            <input id="url" placeholder="https://m.place.naver.com/..." />
+          </div>
+          <div>
+            <label>요금제</label>
+            <select id="plan">
+              <option value="free">FREE (진단)</option>
+              <option value="pro">PRO (전체 리포트)</option>
+            </select>
+          </div>
+          <div>
+            <label>&nbsp;</label>
+            <button id="run">Analyze</button>
+          </div>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <span class="muted">※ “원본(JSON)”은 유료가 아니라 개발자용 디버그로 숨깁니다.</span>
+        </div>
+      </div>
+
+      <div id="result" style="display:none">
+        <div class="sectionTitle">
+          <h2>결과 요약</h2>
+          <span class="muted" id="metaLine"></span>
+        </div>
+
+        <div class="kpi">
+          <div class="box">
+            <div class="t">등급</div>
+            <div class="v"><span id="grade" class="grade F">F</span></div>
+          </div>
+          <div class="box">
+            <div class="t">총점</div>
+            <div class="v" id="totalScore">-</div>
+          </div>
+          <div class="box">
+            <div class="t">업종</div>
+            <div class="v" style="font-size:16px" id="industry">-</div>
+          </div>
+          <div class="box">
+            <div class="t">업체명</div>
+            <div class="v" style="font-size:16px" id="placeName">-</div>
+          </div>
+        </div>
+
+        <div class="sectionTitle">
+          <h2>무료 진단 항목</h2>
+          <span class="muted">상세설명 · 오시는길 · 대표키워드 · 리뷰 · 사진</span>
+        </div>
+
+        <div class="two">
+          <div class="card pad">
+            <div class="list" id="auditList"></div>
+          </div>
+          <div class="card pad">
+            <b>대표키워드(현재 5개)</b>
+            <div class="chips" id="kwExisting"></div>
+            <div style="height:10px"></div>
+            <b>추천 대표키워드 5개</b>
+            <div class="chips" id="kwSuggested"></div>
+          </div>
+        </div>
+
+        <div id="proBlock" style="display:none">
+          <div class="sectionTitle">
+            <h2>PRO 리포트</h2>
+            <span class="muted">경쟁사 Top5 키워드 + 복붙 완성본 + 운영전략</span>
+          </div>
+
+          <div class="two">
+            <div class="card pad">
+              <b>경쟁사 Top5 대표키워드</b>
+              <div id="competitors" class="list" style="margin-top:10px"></div>
+            </div>
+
+            <div class="card pad">
+              <b>복붙 완성본</b>
+              <div style="height:10px"></div>
+
+              <div>
+                <div class="itemTop">
+                  <b>상세설명</b>
+                  <span class="muted">Copy해서 플레이스에 붙여넣기</span>
+                </div>
+                <div id="descCopy" class="textbox" style="margin-top:8px"></div>
+                <div class="actions">
+                  <button class="btn2 primary" id="copyDesc">복사</button>
+                </div>
+              </div>
+
+              <div style="height:12px"></div>
+
+              <div>
+                <div class="itemTop">
+                  <b>오시는길</b>
+                  <span class="muted">출구/도보/층/주차 포함</span>
+                </div>
+                <div id="dirCopy" class="textbox" style="margin-top:8px"></div>
+                <div class="actions">
+                  <button class="btn2 primary" id="copyDir">복사</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card pad" style="margin-top:10px">
+            <b>리뷰/사진 운영 전략</b>
+            <div class="textbox" id="opsTips" style="margin-top:8px"></div>
+          </div>
+        </div>
+
+        <div class="sectionTitle">
+          <h2>고급</h2>
+          <span class="muted">개발자용</span>
+        </div>
+
+        <details>
+          <summary>원본(JSON) 보기 (개발자용)</summary>
+          <pre id="raw"></pre>
+        </details>
+      </div>
+    </div>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+
+      function setGrade(el, g){
+        el.textContent = g || "-";
+        el.className = "grade " + (g || "F");
+      }
+
+      function pct(n){ n = Number(n||0); if (n<0) n=0; if (n>100) n=100; return n.toFixed(0)+"%"; }
+
+      function renderAudit(audit){
+        const root = $("auditList");
+        root.innerHTML = "";
+        const breakdown = audit?.scores?.breakdown || audit?.breakdown || {};
+        const reasons = audit?.scores?.reasons || audit?.reasons || {};
+
+        const items = [
+          ["상세설명", breakdown.description ?? 0, reasons.description || []],
+          ["오시는길", breakdown.directions ?? 0, reasons.directions || []],
+          ["대표키워드", breakdown.keywords ?? 0, reasons.keywords || []],
+          ["리뷰", breakdown.reviews ?? 0, reasons.reviews || []],
+          ["사진", breakdown.photos ?? 0, reasons.photos || []],
+        ];
+
+        items.forEach(([title, score, reasonArr])=>{
+          const div = document.createElement("div");
+          div.className = "item";
+          div.innerHTML = `
+            <div class="itemTop">
+              <b>${title}</b>
+              <span>${score} / 100</span>
+            </div>
+            <div class="bar"><i style="width:${pct(score)}"></i></div>
+            <div class="muted" style="margin-top:8px;line-height:1.5">
+              ${(reasonArr && reasonArr.length) ? reasonArr.map(x=>`- ${x}`).join("<br/>") : "진단 메시지 없음"}
+            </div>
+          `;
+          root.appendChild(div);
+        });
+      }
+
+      function chips(el, arr){
+        el.innerHTML = "";
+        (arr || []).forEach(k=>{
+          const c = document.createElement("span");
+          c.className = "chip";
+          c.textContent = k;
+          el.appendChild(c);
+        });
+      }
+
+      function competitorList(el, competitors){
+        el.innerHTML = "";
+        (competitors || []).slice(0,5).forEach((c, idx)=>{
+          const div = document.createElement("div");
+          div.className = "item";
+          div.innerHTML = `
+            <div class="itemTop">
+              <b>#${idx+1} ${c.placeId || "-"}</b>
+              <span class="muted">${c.placeUrl || ""}</span>
+            </div>
+            <div class="chips">
+              ${(c.keywords5 || []).map(k=>`<span class="chip">${k}</span>`).join("") || "<span class='muted'>키워드 없음</span>"}
+            </div>
+          `;
+          el.appendChild(div);
+        });
+      }
+
+      async function copyText(text){
+        try{
+          await navigator.clipboard.writeText(text || "");
+          alert("복사 완료!");
+        }catch(e){
+          alert("복사 실패: 브라우저 권한을 확인해주세요.");
+        }
+      }
+
+      $("copyDesc").onclick = () => copyText($("descCopy").textContent);
+      $("copyDir").onclick  = () => copyText($("dirCopy").textContent);
+
+      $("run").onclick = async () => {
+        const url = $("url").value.trim();
+        const plan = $("plan").value;
+        if(!url) return alert("URL을 입력해줘");
+
+        $("run").disabled = true;
+        $("run").textContent = "Analyzing...";
+
+        try{
+          const resp = await fetch("/analyze", {
+            method:"POST",
+            headers:{ "Content-Type":"application/json" },
+            body: JSON.stringify({
+              input: { mode: "place_url", placeUrl: url },
+              options: { plan, debug: false } // 원본 debug는 기본 false
+            })
+          });
+
+          const data = await resp.json();
+          if(!resp.ok) throw new Error(data?.message || "분석 실패");
+
+          $("result").style.display = "block";
+
+          // 상단 요약
+          const grade = data?.place?.audit?.scores?.grade || data?.scores?.grade || data?.place?.audit?.grade || "F";
+          const total = data?.place?.audit?.scores?.total || data?.scores?.total || data?.place?.audit?.total || "-";
+          setGrade($("grade"), grade);
+          $("totalScore").textContent = total;
+          $("industry").textContent = data?.industry?.subcategory || data?.industry?.vertical || "-";
+          $("placeName").textContent = data?.place?.name || "-";
+          $("metaLine").textContent = data?.meta?.placeUrl ? data.meta.placeUrl : "";
+
+          // 무료 진단
+          renderAudit(data?.place?.audit || data?.place?.audit?.scores || data?.place?.audit?.scores || data?.place?.audit);
+
+          chips($("kwExisting"), data?.place?.keywords5 || data?.place?.keywords?.slice?.(0,5) || []);
+          chips($("kwSuggested"), (data?.place?.keyword?.suggested5) ? data.place.keyword.suggested5 : (data?.place?.audit?.keyword?.suggested5 || data?.place?.audit?.keywordPack?.suggested5 || []));
+
+          // PRO 블록
+          const isPro = plan === "pro";
+          $("proBlock").style.display = isPro ? "block" : "none";
+
+          if(isPro){
+            competitorList($("competitors"), data?.place?.competitors || []);
+            // PRO 복붙본(서버에서 제공하는 값으로 연결하면 됨)
+            $("descCopy").textContent = data?.place?._proRaw?.descriptionRewrite || data?.recommend?._proRaw?.descriptionRewrite || data?.recommend?.rewrite?.description || "";
+            $("dirCopy").textContent  = data?.place?._proRaw?.directionsRewrite  || data?.recommend?._proRaw?.directionsRewrite  || data?.recommend?.rewrite?.directions || "";
+
+            const tips =
+              (data?.place?._proRaw?.proTodo?.length ? data.place._proRaw.proTodo.map(x=>`- ${x.action} (${x.impact}) : ${x.how}`).join("\n") : "") ||
+              (data?.recommend?.todoTop5?.length ? data.recommend.todoTop5.map(x=>`- ${x.action} : ${x.how}`).join("\n") : "전략 추천 데이터가 없습니다.");
+            $("opsTips").textContent = tips;
+          }
+
+          // 원본(JSON) (개발자용)
+          $("raw").textContent = JSON.stringify(data, null, 2);
+
+        }catch(e){
+          alert(e.message || String(e));
+        }finally{
+          $("run").disabled = false;
+          $("run").textContent = "Analyze";
+        }
+      };
+    </script>
+  </body>
+</html>
