@@ -45,7 +45,7 @@ export async function fetchBasicFieldsViaPlaywright(
   await page.waitForTimeout(900);
   step({ step: "wait.900" });
 
-  // 1) warmup (스크롤/더보기)
+  // 1) warmup (스크롤/더보기/정보탭)
   await warmUpForHiddenSections(page, debug);
   step({ step: "warmup.done" });
 
@@ -53,7 +53,7 @@ export async function fetchBasicFieldsViaPlaywright(
   let raw = await collect(page);
   step({ step: "collect.1", snapshot: summarizeRaw(raw) });
 
-  // 3) 주소/오시는길이 비면 "지도/길찾기/오시는길" 클릭 시도 후 재수집
+  // 3) 주소/오시는길이 비면 "길찾기/지도/오시는길" 클릭 시도 후 재수집
   const needAddress = !pickFirstMeaningful(raw.addrCandidates);
   const needDir = !pickFirstMeaningful(raw.dirCandidates);
 
@@ -64,7 +64,7 @@ export async function fetchBasicFieldsViaPlaywright(
     step({ step: "collect.after.openDirections", snapshot: summarizeRaw(raw) });
   }
 
-  // 4) 그래도 비면 strong warmup 한 번 더
+  // 4) 그래도 주소/오시는길이 비면 strong warmup 한 번 더
   const stillNeed =
     !pickFirstMeaningful(raw.addrCandidates) || !pickFirstMeaningful(raw.dirCandidates);
 
@@ -81,19 +81,23 @@ export async function fetchBasicFieldsViaPlaywright(
   fields.name = pickFirstMeaningful(raw.nameCandidates);
   fields.category = cleanCategory(pickFirstMeaningful(raw.categoryCandidates));
 
-  // ✅ 주소: DOM 후보 -> ld+json -> body 정규식
+  // ✅ 주소(가장 중요): dt/dd -> 라벨근처 -> body 정규식
   const addrFromDom = cleanAddress(pickFirstMeaningful(raw.addrCandidates) || "");
-  const addrFromLd = cleanAddress(extractAddressFromLdJson(raw.ldJsonText) || "");
+  const addrFromPairs = cleanAddress(raw.pairs?.address || "");
+  const roadFromPairs = cleanAddress(raw.pairs?.roadAddress || "");
+
+  // body 정규식 (서울특별시/서울시/서울 등 변형 포함)
   const addrFromBody = cleanAddress(extractKoreanAddressFromText(raw.bodyText) || "");
-  fields.address = pickFirstMeaningful([addrFromDom, addrFromLd, addrFromBody].filter(Boolean));
 
-  // 도로명은 ldjson에 따로 있을 수 있음
-  fields.roadAddress = cleanAddress(extractRoadAddressFromLdJson(raw.ldJsonText) || "");
+  fields.address = pickFirstMeaningful([addrFromPairs, addrFromDom, addrFromBody].filter(Boolean));
+  fields.roadAddress = pickFirstMeaningful([roadFromPairs, raw.roadCandidate || ""].filter(Boolean));
 
-  // ✅ 오시는길: DOM 후보 -> body에서 “출구/도보/주차” 포함 문장 추출
+  // ✅ 오시는길: DOM 후보 + body에서 “출구/도보/주차” 문장 추출 + 주차문장 결합
   const dirFromDom = cleanDirections(pickFirstMeaningful(raw.dirCandidates) || "");
   const dirFromBody = cleanDirections(extractDirectionsFromText(raw.bodyText) || "");
-  fields.directions = pickFirstMeaningful([dirFromDom, dirFromBody].filter(Boolean));
+
+  // 주차 문장만 잡히는 케이스(너 지금 이 상태) → 출구/도보 문장 우선 결합
+  fields.directions = mergeDirections(dirFromBody, dirFromDom);
 
   // ✅ 소개/상세설명: DOM 후보 -> NEXT_DATA -> meta -> body
   const fromDom = cleanDescription(pickFirstMeaningful(raw.descCandidates) || "");
@@ -104,7 +108,7 @@ export async function fetchBasicFieldsViaPlaywright(
   const desc = pickFirstMeaningful([fromDom, fromNext, fromMeta, fromBody].filter(Boolean));
   fields.description = cleanDescription(desc || "");
 
-  // “접기” 제거(너 결과에 붙어있었음)
+  // “접기” 제거
   if (fields.description) fields.description = fields.description.replace(/접기\s*$/g, "").trim();
 
   if (looksLikeReviewSnippet(fields.description || "")) fields.description = "";
@@ -120,12 +124,6 @@ export async function fetchBasicFieldsViaPlaywright(
   };
 
   debug.elapsedMs = Date.now() - t0;
-  debug.raw = {
-    ogDesc: raw.ogDesc,
-    metaDesc: raw.metaDesc,
-    hasNextData: !!raw.nextJsonText,
-    hasLdJson: !!raw.ldJsonText,
-  };
 
   return { fields, debug };
 }
@@ -141,7 +139,7 @@ async function warmUpForHiddenSections(page: Page, debug: any, strong = false) {
   await scrollPage(page, strong ? 6 : 4, act);
   await clickMoreButtons(page, act, strong ? 7 : 3);
 
-  // "정보" 탭 있으면 한 번 눌러주기
+  // "정보" 탭 있으면 눌러주기
   await tryClickByText(page, ["정보", "매장정보", "가게정보"], act);
 
   await scrollPage(page, strong ? 4 : 2, act);
@@ -198,21 +196,13 @@ async function tryClickByText(page: Page, labels: string[], act: (a: any) => voi
 }
 
 /* =========================================================
- * ✅ 오시는길/지도 레이어 열기 시도 (핵심)
+ * ✅ 오시는길/지도 레이어 열기 시도
  * ========================================================= */
 async function tryOpenDirectionsLayer(page: Page, debug: any) {
   const t = Date.now();
   const act = (a: any) => debug.actions.push({ at: Date.now() - t, ...a });
 
-  // 모바일 네이버플레이스에서 흔히 보이는 텍스트/버튼들
-  const tries = [
-    "오시는길",
-    "찾아오는길",
-    "길찾기",
-    "지도",
-    "위치",
-    "주차",
-  ];
+  const tries = ["오시는길", "찾아오는길", "길찾기", "지도", "위치", "주차"];
 
   for (const label of tries) {
     try {
@@ -229,7 +219,6 @@ async function tryOpenDirectionsLayer(page: Page, debug: any) {
     }
   }
 
-  // 버튼 role 기반도 한 번 더
   try {
     const btn = page.getByRole("button", { name: /길찾기|오시는길|지도/i }).first();
     const n = await btn.count();
@@ -247,7 +236,7 @@ async function tryOpenDirectionsLayer(page: Page, debug: any) {
 }
 
 /* =========================================================
- * 수집 로직
+ * 수집 로직 (주소 강제 강화)
  * ========================================================= */
 
 async function collect(page: Page) {
@@ -256,11 +245,6 @@ async function collect(page: Page) {
 
     const norm = (s: string) => (s || "").replace(/\s+/g, " ").trim();
     const textOf = (el: any) => norm(el?.textContent ?? "");
-
-    const text = (sel: string) => {
-      const el = d?.querySelector?.(sel);
-      return textOf(el);
-    };
 
     const attr = (sel: string, name: string) => {
       const el = d?.querySelector?.(sel);
@@ -274,46 +258,71 @@ async function collect(page: Page) {
     // NEXT_DATA
     let nextJsonText = "";
     try {
-      nextJsonText = text("#__NEXT_DATA__");
-    } catch {}
-
-    // ld+json (주소 들어있는 경우 많음)
-    let ldJsonText = "";
-    try {
-      const nodes = Array.from(d.querySelectorAll('script[type="application/ld+json"]'));
-      ldJsonText = nodes.map((n: any) => (n?.textContent ?? "").trim()).filter(Boolean).join("\n");
+      const el = d?.querySelector?.("#__NEXT_DATA__");
+      nextJsonText = norm(el?.textContent ?? "");
     } catch {}
 
     // body snapshot
     let bodyText = "";
     try {
-      bodyText = (d?.body?.innerText ?? "").slice(0, 20000);
+      bodyText = (d?.body?.innerText ?? "").slice(0, 25000);
     } catch {}
 
-    // label 근처 값 뽑기
-    const pickNearLabel = (label: string) => {
-      const all = Array.from(d.querySelectorAll("dt, span, div, strong, em, h1, h2, h3, p, a, button"));
-      const hit = all.find((el: any) => textOf(el) === label);
+    // ✅ dt/dd 구조 파싱 (네이버는 여기로 주소/전화/영업시간을 많이 넣음)
+    const pairs: any = { address: "", roadAddress: "", parking: "" };
+    try {
+      const dts = Array.from(d.querySelectorAll("dt"));
+      for (const dt of dts) {
+        const k = textOf(dt);
+        const dd = (dt as any).nextElementSibling;
+        const v = textOf(dd);
+
+        if (!v) continue;
+
+        if (/주소|위치|도로명주소/i.test(k)) {
+          // "도로명주소"면 roadAddress로도 저장
+          if (/도로명주소/i.test(k) && !pairs.roadAddress) pairs.roadAddress = v;
+          if (!pairs.address) pairs.address = v;
+        }
+
+        if (/주차/i.test(k) && !pairs.parking) pairs.parking = v;
+      }
+    } catch {}
+
+    // ✅ “라벨 포함(includes)” 기반으로 주변값 찾기
+    const pickNearLabelIncludes = (label: string) => {
+      const all = Array.from(
+        d.querySelectorAll("dt, dd, span, div, strong, em, p, a, button, li")
+      );
+
+      const hit = all.find((el: any) => {
+        const t = textOf(el);
+        return t && t.includes(label);
+      });
       if (!hit) return "";
 
+      // dt/dd면 dd 우선
       if ((hit as any).tagName?.toLowerCase() === "dt") {
         const dd = (hit as any).nextElementSibling;
         const v = textOf(dd);
         if (v) return v;
       }
 
+      // 같은 부모의 다음 형제
       const parent = (hit as any).parentElement;
       if (parent) {
         const children = Array.from(parent.children);
         const idx = children.indexOf(hit as any);
-        if (idx >= 0 && children[idx + 1]) {
-          const v = textOf(children[idx + 1]);
+        for (let i = 1; i <= 3; i++) {
+          const sib = children[idx + i];
+          const v = textOf(sib);
           if (v) return v;
         }
       }
 
+      // 다음 형제 몇 개
       let cur: any = hit;
-      for (let i = 0; i < 12; i++) {
+      for (let i = 0; i < 8; i++) {
         const next = cur?.nextElementSibling;
         const v = textOf(next);
         if (v) return v;
@@ -325,35 +334,41 @@ async function collect(page: Page) {
     };
 
     const nameCandidates = [
-      text("h1"),
-      text('[data-testid="title"]'),
-      text(".Fc1rA"),
+      textOf(d.querySelector("h1")),
+      textOf(d.querySelector('[data-testid="title"]')),
+      textOf(d.querySelector(".Fc1rA")),
     ].filter(Boolean);
 
     const categoryCandidates = [
-      text("h1 + div"),
-      text("h1 + span"),
-      text('[class*="category"]'),
+      textOf(d.querySelector("h1 + div")),
+      textOf(d.querySelector("h1 + span")),
+      pickNearLabelIncludes("업종"),
+      pickNearLabelIncludes("카테고리"),
     ].filter(Boolean);
 
+    // 주소 후보 우선순위: dt/dd pairs -> includes 기반 -> class
     const addrCandidates = [
-      pickNearLabel("주소"),
-      pickNearLabel("위치"),
-      pickNearLabel("도로명주소"),
-      text('[class*="address"]'),
+      pairs.address,
+      pickNearLabelIncludes("도로명주소"),
+      pickNearLabelIncludes("주소"),
+      pickNearLabelIncludes("위치"),
+      textOf(d.querySelector('[class*="address"]')),
     ].filter(Boolean);
+
+    const roadCandidate = pairs.roadAddress || pickNearLabelIncludes("도로명주소") || "";
 
     const dirCandidates = [
-      pickNearLabel("오시는길"),
-      pickNearLabel("찾아오는길"),
-      pickNearLabel("길안내"),
-      pickNearLabel("주차"),
+      pickNearLabelIncludes("오시는길"),
+      pickNearLabelIncludes("찾아오는길"),
+      pickNearLabelIncludes("길안내"),
+      pairs.parking,
+      pickNearLabelIncludes("주차"),
     ].filter(Boolean);
 
     const descCandidates = [
-      pickNearLabel("소개"),
-      pickNearLabel("상세설명"),
-      pickNearLabel("매장소개"),
+      pickNearLabelIncludes("소개"),
+      pickNearLabelIncludes("상세설명"),
+      pickNearLabelIncludes("매장소개"),
     ].filter(Boolean);
 
     return {
@@ -362,10 +377,11 @@ async function collect(page: Page) {
       addrCandidates,
       dirCandidates,
       descCandidates,
+      roadCandidate,
+      pairs,
       ogDesc,
       metaDesc,
       nextJsonText,
-      ldJsonText,
       bodyText,
     };
   });
@@ -379,8 +395,9 @@ function summarizeRaw(raw: any) {
     addr: pick(raw?.addrCandidates),
     dir: pick(raw?.dirCandidates),
     desc: pick(raw?.descCandidates),
-    hasNext: !!raw?.nextJsonText,
-    hasLd: !!raw?.ldJsonText,
+    road: (raw?.roadCandidate || "").slice(0, 60),
+    pairAddr: (raw?.pairs?.address || "").slice(0, 60),
+    pairRoad: (raw?.pairs?.roadAddress || "").slice(0, 60),
     ogDesc: (raw?.ogDesc || "").slice(0, 40),
   };
 }
@@ -405,8 +422,8 @@ function cleanCategory(s: string) {
   let x = (s || "").trim();
   if (!x) return "";
   x = x.replace(/\s+/g, " ").trim();
-  if (x.length > 40) x = x.slice(0, 40).trim();
   x = x.replace(/방문자리뷰.*$/g, "").trim();
+  if (x.length > 40) x = x.slice(0, 40).trim();
   return x;
 }
 
@@ -415,9 +432,10 @@ function cleanAddress(s: string) {
   if (!x) return "";
 
   x = x.replace(/지도내비게이션거리뷰/g, " ").replace(/\s+/g, " ").trim();
+  x = x.replace(/복사/g, "").trim();
   x = x.replace(/(\d)([가-힣])/g, "$1 $2");
 
-  // 역/거리 안내 제거
+  // "서대문역 4번 출구에서 90m" 같은 안내문 제거
   x = x.replace(/서대문역.*?(m|미터).*$/i, "").trim();
   x = x.replace(/(\d+)\s*m\s*.*$/i, "").trim();
 
@@ -436,6 +454,21 @@ function cleanDirections(s: string) {
   return x;
 }
 
+function mergeDirections(body: string, dom: string) {
+  const b = (body || "").trim();
+  const d = (dom || "").trim();
+  if (b && d) {
+    // 같은 내용이면 하나만
+    if (b.includes(d) || d.includes(b)) return (b.length >= d.length ? b : d).trim();
+    // "출구/도보"가 있는 쪽을 앞으로
+    const score = (s: string) => (/(출구|도보|분|미터|m)/.test(s) ? 2 : 0) + (/(주차)/.test(s) ? 1 : 0);
+    const first = score(b) >= score(d) ? b : d;
+    const second = first === b ? d : b;
+    return `${first} / ${second}`.trim();
+  }
+  return (b || d || "").trim();
+}
+
 function cleanDescription(s: string) {
   let x = (s || "").trim();
   if (!x) return "";
@@ -450,45 +483,14 @@ function looksLikeReviewSnippet(s: string) {
   return /방문자리뷰|블로그리뷰/.test(x) && x.length < 80;
 }
 
-// ✅ ld+json에서 address 꺼내기
-function extractAddressFromLdJson(ldJsonText: string) {
-  const t = (ldJsonText || "").trim();
-  if (!t) return "";
-  try {
-    // 여러 개일 수 있어서 대충 문자열 탐색
-    const s = t;
-    // addressLocality / streetAddress 조합
-    const m1 = s.match(/"streetAddress"\s*:\s*"([^"]{4,200})"/);
-    const m2 = s.match(/"addressLocality"\s*:\s*"([^"]{2,100})"/);
-    const m3 = s.match(/"addressRegion"\s*:\s*"([^"]{2,100})"/);
-
-    const parts = [m3?.[1], m2?.[1], m1?.[1]].filter(Boolean);
-    return parts.join(" ").trim();
-  } catch {
-    return "";
-  }
-}
-
-// ✅ ld+json에서 도로명만 따로
-function extractRoadAddressFromLdJson(ldJsonText: string) {
-  const t = (ldJsonText || "").trim();
-  if (!t) return "";
-  try {
-    const m = t.match(/"streetAddress"\s*:\s*"([^"]{4,200})"/);
-    return m?.[1] ? m[1].trim() : "";
-  } catch {
-    return "";
-  }
-}
-
-// ✅ bodyText에서 한국 주소 정규식 추출
+// ✅ bodyText에서 한국 주소 정규식 추출(서울특별시/서울시/서울 모두 허용)
 function extractKoreanAddressFromText(bodyText: string) {
   const t = (bodyText || "").replace(/\s+/g, " ").trim();
   if (!t) return "";
 
-  // “서울 종로구 새문안로 15-1” 같은 형태
+  // 예: 서울(특별시|시) 종로구 새문안로 15-1 2층
   const re =
-    /(서울|부산|대구|인천|광주|대전|울산|세종|경기|강원|충북|충남|전북|전남|경북|경남|제주)\s*[가-힣0-9\s]+?(구|군|시)\s*[가-힣0-9\s]+?(로|길)\s*\d{1,4}(-\d{1,4})?/;
+    /((서울특별시|서울시|서울|부산광역시|부산시|부산|대구광역시|대구시|대구|인천광역시|인천시|인천|광주광역시|광주시|광주|대전광역시|대전시|대전|울산광역시|울산시|울산|세종특별자치시|세종|경기도|경기|강원특별자치도|강원도|강원|충청북도|충북|충청남도|충남|전북특별자치도|전라북도|전북|전라남도|전남|경상북도|경북|경상남도|경남|제주특별자치도|제주도|제주)\s*[가-힣0-9\s]+?(구|군|시)\s*[가-힣0-9\s]+?(로|길)\s*\d{1,4}(-\d{1,4})?(\s*(층|호|번지)\s*[0-9가-힣\-]*)?)/;
 
   const m = t.match(re);
   return m?.[0] ? m[0].trim() : "";
@@ -499,14 +501,23 @@ function extractDirectionsFromText(bodyText: string) {
   const t = (bodyText || "").replace(/\s+/g, " ").trim();
   if (!t) return "";
 
-  const keys = ["출구", "도보", "주차", "가까", "m", "미터", "분"];
+  // 출구/도보 우선
+  const keys = ["번 출구", "출구", "도보", "분", "m", "미터"];
   for (const k of keys) {
     const idx = t.indexOf(k);
     if (idx > -1) {
-      const slice = t.slice(Math.max(0, idx - 30), idx + 120);
+      const slice = t.slice(Math.max(0, idx - 40), idx + 140);
       if (slice.length >= 12) return slice.trim();
     }
   }
+
+  // 없으면 주차라도
+  const pIdx = t.indexOf("주차");
+  if (pIdx > -1) {
+    const slice = t.slice(Math.max(0, pIdx - 30), pIdx + 160);
+    if (slice.length >= 12) return slice.trim();
+  }
+
   return "";
 }
 
@@ -553,4 +564,3 @@ function extractIntroFromBodyText(bodyText: string) {
 
   return slice;
 }
-
