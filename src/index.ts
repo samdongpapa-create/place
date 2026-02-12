@@ -1,30 +1,24 @@
-// src/index.ts
-
 import express from "express";
 import path from "path";
-import { fileURLToPath } from "url";
-import { analyzeRouter } from "./routes/analyze.js";
+import analyzeRouter from "./routes/analyze.js";
 
 const app = express();
-app.use(express.json({ limit: "2mb" }));
 
-// ESM 대응
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+app.use(express.json());
 
-// ✅ public 폴더 서빙
-app.use(express.static(path.join(__dirname, "../public")));
+// 🔥 public 경로 절대경로로 잡기
+const publicDir = path.join(process.cwd(), "public");
 
-// ✅ API
-app.use("/api", analyzeRouter);
+app.use(express.static(publicDir));
 
-// SPA fallback
-app.get("*", (_req, res) => {
-  res.sendFile(path.join(__dirname, "../public/index.html"));
+app.get("/", (_req, res) => {
+  res.sendFile(path.join(publicDir, "index.html"));
 });
 
-const port = Number(process.env.PORT || 3000);
+app.use("/api", analyzeRouter);
 
-app.listen(port, () => {
-  console.log(`🚀 Server running on port ${port}`);
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, () => {
+  console.log("Server running on port", PORT);
 });
